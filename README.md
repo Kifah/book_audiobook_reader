@@ -94,7 +94,21 @@ python3 convert_books.py --dry-run --dry-run-seconds 60 --book "The Ancient Citi
 python3 convert_books.py --list
 ```
 
-**What it does:**
+### Resume an aborted run (`--continue`)
+
+If a full-book conversion is interrupted (Ctrl-C, crash, network outage, kicked offline), don't restart from scratch — pick up where you left off:
+
+```bash
+# Run as normal, get interrupted
+python3 convert_books.py
+# ... Ctrl-C mid-book ...
+
+# Resume — only renders missing chapters, keeps everything else
+python3 convert_books.py --continue
+# or equivalently
+python3 convert_books.py --resume
+```
+**What it does (dry-run):**
 
 - Picks the first chapter with real text (skips blank title pages)
 - Cuts to roughly `--dry-run-seconds` worth of characters (sentence-aware)
@@ -103,6 +117,29 @@ python3 convert_books.py --list
 - Exits without touching anything else
 
 **Heads-up:** dry-run STILL uses your real TTS key (1 API call). If you want a true "no-cost" preview first, see [Voice examples](#voice-examples) below for raw API snippets you can paste into your terminal.
+
+### Resume an aborted run (`--continue`)
+
+If a full-book conversion is interrupted (Ctrl-C, crash, network outage, kicked offline), don't restart from scratch — pick up where you left off:
+
+```bash
+# Run as normal, get interrupted
+python3 convert_books.py
+# ... Ctrl-C mid-book ...
+
+# Resume — only renders missing chapters, keeps everything else
+python3 convert_books.py --continue
+# or equivalently
+python3 convert_books.py --resume
+```
+
+**What it does (`--continue`):**
+- Scans `audiobooks/<book>/chapters/` for already-rendered MP3s
+- Skips TTS+concat for any chapter with a non-empty MP3 (logs `SKIP 'Title' — already exists (X.X MB)`)
+- Rebuilds the full-book MP3 only if at least one chapter was re-rendered
+- Mutually exclusive with `--dry-run`
+
+**When NOT to use `--continue`:** if you've edited the EPUB since the abort. The script matches chapter files by index (`01 - <slug>.mp3`), so adding/removing/reordering chapters in the source will leave the script in a confused state. Do a fresh run instead.
 
 ---
 
@@ -307,7 +344,7 @@ Token-based models bill audio output at ~$12/M tokens. `tts-1` and `tts-1-hd` bi
 - **No SSML on OpenAI-compatible providers** — `gpt-4o-mini-tts-2025-12-15` doesn't accept SSML. Use the `instructions` field for prosody hints.
 - **EPUB only** — no MOBI, AZW3, or PDF. Convert first with [Calibre](https://calibre-ebook.com) (`ebook-convert input.mobi output.epub`).
 - **DRM-locked books won't work** — only DRM-free EPUBs.
-- **No resume on crash** — if the run dies mid-book, you have to restart the whole book. (Easiest workaround: rename half-finished books with a `.partial` suffix before re-running.)
+- **Resume on crash** — use `--continue` (or `--resume`) to pick up where an aborted run left off. Skips already-rendered chapters; only renders the missing ones.
 - **ElevenLabs speed control is post-process only** — ElevenLabs' API doesn't accept a `speed` parameter. See the ElevenLabs section for the ffmpeg workaround.
 
 ---
@@ -324,7 +361,6 @@ LOG_LEVEL=DEBUG python3 convert_books.py
 ```
 
 The script has no test suite yet — contributions welcome. Good first issues:
-- Resume support (skip already-rendered chapters)
 - EPUB chapter detection improvements (handles nav.xhtml better)
 - Configurable pause-between-chapters
 - Per-chapter metadata (ID3 tags)
