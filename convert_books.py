@@ -22,6 +22,7 @@ import shutil
 import zipfile
 import logging
 import unicodedata
+import subprocess
 from pathlib import Path
 from urllib import request, error
 
@@ -406,17 +407,30 @@ def render_chapter(title: str, text: str, out_path: Path, tmp_dir: Path) -> None
         concat_list = tmp_dir / "concat.txt"
         with open(concat_list, "w") as f:
             for p in part_files:
-                # Escape single quotes per ffmpeg concat demuxer spec
-                f.write(f"file '{p.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+                # Resolve to absolute path and escape single quotes per ffmpeg
+                # concat demuxer spec. Absolute paths sidestep any cwd-resolution
+                # quirks when the script and ffmpeg see different cwds
+                # (e.g. macOS Finder "Open With", launchd, etc.).
+                abs_p = p.resolve()
+                f.write(
+                    f"file '{abs_p.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
+                )
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
+            "-i", str(concat_list.resolve()),
             "-c", "copy",
             str(out_path),
         ]
-        rc = os.spawnvp(os.P_WAIT, "ffmpeg", cmd)
+        log.debug("    ffmpeg cwd=%s, cmd=%s", os.getcwd(), cmd)
+        rc = subprocess.run(cmd, cwd=os.getcwd()).returncode
         if rc != 0:
+            # Dump the concat list for debugging
+            try:
+                with open(concat_list) as f:
+                    log.error("    concat.txt contents:\n%s", f.read())
+            except Exception:
+                pass
             raise RuntimeError(f"ffmpeg concat failed with exit code {rc}")
     else:
         # Pure-Python fallback: raw byte concat. Works for MP3 because the
@@ -534,16 +548,26 @@ def convert_book(epub_path: Path) -> Path:
         concat_list = tmp_dir / "concat_full.txt"
         with open(concat_list, "w") as f:
             for p in chapter_mp3s:
-                f.write(f"file '{p.as_posix()}'\n")
+                # Absolute paths (see render_chapter comment for rationale)
+                abs_p = p.resolve()
+                f.write(
+                    f"file '{abs_p.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
+                )
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
+            "-i", str(concat_list.resolve()),
             "-c", "copy",
             str(full_path),
         ]
-        rc = os.spawnvp(os.P_WAIT, "ffmpeg", cmd)
+        log.debug("    ffmpeg (full) cwd=%s, cmd=%s", os.getcwd(), cmd)
+        rc = subprocess.run(cmd, cwd=os.getcwd()).returncode
         if rc != 0:
+            try:
+                with open(concat_list) as f:
+                    log.error("    concat_full.txt contents:\n%s", f.read())
+            except Exception:
+                pass
             raise RuntimeError(f"ffmpeg full-book concat failed with exit code {rc}")
     else:
         log.warning("ffmpeg not found; doing raw MP3 byte-append for full book")
