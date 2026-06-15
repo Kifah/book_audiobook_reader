@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Project artefacts
+epubs/
+audiobooks/
+*.epub
+*.mp3
+*.opus
+*.aac
+*.flac
+*.wav
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
