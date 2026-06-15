@@ -147,28 +147,57 @@ TTS_VOICE=onyx
 TTS_INSTRUCTIONS="Speak in a deep, calm American male voice. Pace the narration naturally."
 ```
 
-### Using OpenAI directly
+### Three ready-to-use `.env` files (pick one)
+
+The defaults are tuned for **OpenRouter + `gpt-4o-mini-tts`** with a calm female voice at 1.2× speed. To switch providers, replace the contents of your `.env` with one of the blocks below.
+
+**Option 1 — OpenAI direct (simplest, official, $0.30/M chars)**
 
 ```bash
-# .env
+# .env — OpenAI direct
+TTS_PROVIDER=openai_compatible
 TTS_API_URL=https://api.openai.com/v1/audio/speech
-TTS_API_KEY=sk-proj-...
+TTS_API_KEY=YOUR_OPENAI_KEY_HERE
 TTS_MODEL=gpt-4o-mini-tts
+TTS_VOICE=shimmer
+TTS_SPEED=1.2
+TTS_INSTRUCTIONS="Speak in a calm, warm British female voice. Pace the narration naturally for audiobook listening."
+TTS_FORMAT=mp3
+TTS_CHUNK_CHARS=4000
+TTS_MAX_RETRIES=4
+TTS_RETRY_BACKOFF=2.0
+TTS_REQUEST_TIMEOUT=180
+INPUT_DIR=epubs
+OUTPUT_DIR=audiobooks
+LOG_LEVEL=INFO
 ```
 
-Drop the `openai/` prefix on the model — OpenAI takes bare names.
+Get your key at <https://platform.openai.com/api-keys>. Drop the `openai/` prefix on the model — OpenAI takes bare names.
 
-### Using OpenRouter
+---
 
-[OpenRouter](https://openrouter.ai) routes requests to many providers with one API key. It's the cheapest way to experiment with different TTS models without juggling accounts. The model name needs the `provider/` prefix.
+**Option 2 — OpenRouter (cheapest, many model choices, $0.30/M chars on gpt-4o-mini-tts)**
 
 ```bash
-# .env
-TTS_PROVIDER=openai_compatible       # default — keep this
+# .env — OpenRouter
+TTS_PROVIDER=openai_compatible
 TTS_API_URL=https://openrouter.ai/api/v1/audio/speech
-TTS_API_KEY=sk-or-...
-TTS_MODEL=openai/gpt-4o-mini-tts     # MUST include the provider prefix on OpenRouter
+TTS_API_KEY=YOUR_OPENROUTER_KEY_HERE
+TTS_MODEL=openai/gpt-4o-mini-tts
+TTS_VOICE=shimmer
+TTS_SPEED=1.2
+TTS_INSTRUCTIONS="Speak in a calm, warm British female voice. Pace the narration naturally for audiobook listening."
+TTS_FORMAT=mp3
+TTS_CHUNK_CHARS=4000
+TTS_MAX_RETRIES=4
+TTS_RETRY_BACKOFF=2.0
+TTS_REQUEST_TIMEOUT=180
+INPUT_DIR=epubs
+OUTPUT_DIR=audiobooks
+LOG_LEVEL=INFO
 ```
+
+Get your key at <https://openrouter.ai/keys> (prepaid credits, ~$1-2 is enough for most books). The model name needs the `provider/` prefix — that's the only difference from Option 1.
 
 **Confirmed-working OpenRouter TTS models** (verified June 2026, all OpenAI-compatible):
 
@@ -202,20 +231,34 @@ If you find a new TTS provider on OpenRouter that exposes the OpenAI `/v1/audio/
 
 **Tip for very long books:** OpenRouter has rate limits per model. If you hit a 429, the script's built-in retry will back off and continue. For >20-hour books, you may want to lower `TTS_CHUNK_CHARS` to 2000 and add a small `time.sleep(0.5)` between requests to stay under the per-second quota.
 
-### Using ElevenLabs (highest quality)
+---
+
+**Option 3 — ElevenLabs (highest quality, $5/M chars)**
 
 ElevenLabs is the gold standard for audiobook-grade TTS. Set `TTS_PROVIDER=elevenlabs` and the script switches to ElevenLabs' native `/v1/text-to-speech/{voice_id}` API (not the OpenAI-compatible path).
 
 ```bash
-# .env
+# .env — ElevenLabs
 TTS_PROVIDER=elevenlabs
-TTS_API_KEY=sk_***  # from https://elevenlabs.io → Profile → API Keys
-ELEVENLABS_VOICE_ID=JBFqnCBsd6RMkjVDRZzb   # George (British, male, calm)
-ELEVENLABS_MODEL_ID=eleven_multilingual_v2  # best quality
+TTS_API_KEY=YOUR_ELEVENLABS_KEY_HERE
+TTS_FORMAT=mp3
+TTS_CHUNK_CHARS=4000
+TTS_MAX_RETRIES=4
+TTS_RETRY_BACKOFF=2.0
+TTS_REQUEST_TIMEOUT=180
+INPUT_DIR=epubs
+OUTPUT_DIR=audiobooks
+LOG_LEVEL=INFO
+
+# ElevenLabs-specific (ignored when TTS_PROVIDER != "elevenlabs")
+ELEVENLABS_VOICE_ID=JBFqnCBsd6RMkjVDRZzb    # George (British, male, calm)
+ELEVENLABS_MODEL_ID=eleven_multilingual_v2  # best quality; use eleven_turbo_v2_5 for ~70% cheaper
 ELEVENLABS_STABILITY=0.5
 ELEVENLABS_SIMILARITY=0.75
 ELEVENLABS_STYLE=0.0
 ```
+
+Get your key at <https://elevenlabs.io> → Profile → API Keys.
 
 Popular voice IDs for audiobooks:
 
