@@ -52,6 +52,9 @@ load_dotenv()
 # Dry-run flag (set by --dry-run CLI flag in main(); read by convert_book/render_chapter)
 DRY_RUN = False
 DRY_RUN_SECONDS = 30.0  # approximate; we budget by chars not actual time
+# Continue flag (set by --continue CLI flag; when True, skip chapters that already
+# have an MP3 in audiobooks/<book>/chapters/, so an aborted run can be resumed)
+CONTINUE_RUN = False
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "openai_compatible").strip().lower()
 TTS_API_URL = os.getenv("TTS_API_URL", "https://openrouter.ai/api/v1/audio/speech")
@@ -475,9 +478,12 @@ def convert_book(epub_path: Path) -> Path:
     chapter_dir = work_dir / "chapters"
     chapter_dir.mkdir(exist_ok=True)
     tmp_dir = work_dir / "_tmp"
-    if tmp_dir.exists():
+    if tmp_dir.exists() and not CONTINUE_RUN:
+        # Wipe tmp on a fresh run only — on --continue we may want the
+        # tmp dir to exist for new chapters, but old per-chapter subdirs
+        # from a previous run are harmless (we always use unique chXX dirs).
         shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir()
+    tmp_dir.mkdir(exist_ok=True)
 
     if DRY_RUN:
         log.warning("=" * 60)
@@ -509,22 +515,37 @@ def convert_book(epub_path: Path) -> Path:
             f"Speed: {TTS_SPEED}x",
             f"Chapters: {len(chapters)}",
             f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            "",
-            "## Chapters",
-            "",
         ]
+        if CONTINUE_RUN:
+            manifest_lines.append("Mode: continued from a previous run")
+        manifest_lines.extend(["", "## Chapters", ""])
         for i, ch in enumerate(chapters, start=1):
             manifest_lines.append(f"{i:02d}. {ch['title']}  →  `chapters/{i:02d} - {slugify(ch['title'])}.{TTS_FORMAT}`")
         (work_dir / "README.md").write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
 
     # Render each chapter
     chapter_mp3s: list[Path] = []
+    skipped_existing = 0
     for i, ch in enumerate(chapters, start=1):
         ch_title = ch["title"]
         ch_slug = slugify(ch_title)
         out_path = chapter_dir / f"{i:02d} - {ch_slug}.{TTS_FORMAT}"
+
+        # --continue: if the chapter MP3 already exists with nonzero size,
+        # assume it's a valid prior render and skip TTS + concat for it.
+        # This lets an aborted run pick up where it left off.
+        if CONTINUE_RUN and out_path.exists() and out_path.stat().st_size > 0:
+            log.info("  [%d/%d] SKIP '%s' — already exists (%.1f MB)",
+                     i, len(chapters), ch_title, out_path.stat().st_size / (1024 * 1024))
+            chapter_mp3s.append(out_path)
+            skipped_existing += 1
+            continue
+
         render_chapter(ch_title, ch["text"], out_path, tmp_dir / f"ch{i:02d}")
         chapter_mp3s.append(out_path)
+
+    if CONTINUE_RUN and skipped_existing:
+        log.info("Skipped %d already-rendered chapter(s) (--continue).", skipped_existing)
 
     # Dry-run: report and stop here
     if DRY_RUN:
@@ -549,7 +570,20 @@ def convert_book(epub_path: Path) -> Path:
 
     # Build the full-book MP3
     full_path = work_dir / f"{book_slug} - complete.{TTS_FORMAT}"
-    if len(chapter_mp3s) == 1:
+
+    # --continue: if the full-book MP3 already exists AND every chapter is
+    # accounted for (i.e. nothing was rendered this run), skip the concat.
+    # If any chapter was rendered, we MUST rebuild full_path because the
+    # content has changed.
+    if (
+        CONTINUE_RUN
+        and full_path.exists()
+        and full_path.stat().st_size > 0
+        and skipped_existing == len(chapters)
+    ):
+        log.info("Full-book MP3 already exists (%.1f MB) and no chapters needed rendering — skipping concat.",
+                 full_path.stat().st_size / (1024 * 1024))
+    elif len(chapter_mp3s) == 1:
         shutil.copy2(chapter_mp3s[0], full_path)
     elif ffmpeg_available():
         concat_list = tmp_dir / "concat_full.txt"
@@ -631,22 +665,31 @@ def _parse_args(argv: list[str] | None = None) -> dict:
         "--list", dest="list_books", action="store_true",
         help="List epubs in INPUT_DIR and exit.",
     )
+    p.add_argument(
+        "--continue", "--resume", dest="continue_run", action="store_true",
+        help="Resume an aborted run: skip chapters that already have an MP3 in "
+             "audiobooks/<book>/chapters/ and start from the first missing one. "
+             "Also skips re-rendering the full-book MP3 if it already exists. "
+             "If you've changed the EPUB since the abort, do a fresh run instead.",
+    )
     args = p.parse_args(argv)
     return {
         "dry_run": args.dry_run,
         "dry_run_seconds": args.dry_run_seconds,
         "book": Path(args.book) if args.book else None,
         "list_books": args.list_books,
+        "continue_run": args.continue_run,
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    # Make dry-run flags module-global so convert_book/render_chapter can see them
-    global DRY_RUN, DRY_RUN_SECONDS
+    # Make dry-run / continue flags module-global so convert_book can see them
+    global DRY_RUN, DRY_RUN_SECONDS, CONTINUE_RUN
     DRY_RUN = args["dry_run"]
     DRY_RUN_SECONDS = args["dry_run_seconds"]
+    CONTINUE_RUN = args["continue_run"]
 
     if not INPUT_DIR.exists():
         INPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -690,6 +733,11 @@ def main(argv: list[str] | None = None) -> int:
                     "Install ffmpeg for cleaner chapter joins.")
     if DRY_RUN:
         log.info("DRY RUN mode — will render ~%.0fs per book, no zips.", DRY_RUN_SECONDS)
+    if CONTINUE_RUN:
+        if DRY_RUN:
+            log.error("--continue and --dry-run are incompatible. Pick one.")
+            return 1
+        log.info("CONTINUE mode — will skip chapters that already have an MP3 in chapters/.")
 
     t0 = time.time()
     successes, failures = 0, 0
