@@ -415,11 +415,18 @@ def render_chapter(title: str, text: str, out_path: Path, tmp_dir: Path) -> None
                 f.write(
                     f"file '{abs_p.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
                 )
+        # Re-encode the concat through libmp3lame rather than -c copy.
+        # -c copy between independently-encoded MP3 chunks (Kokoro, OpenAI,
+        # ElevenLabs) produces "non monotonically increasing dts" muxer
+        # warnings because each MP3's internal timestamps don't form a
+        # continuous sequence. The audio is still valid, but the log noise
+        # is distracting. Re-encoding is CPU-only (~100ms for a 3h chapter)
+        # and produces clean output.
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list.resolve()),
-            "-c", "copy",
+            "-c:a", "libmp3lame", "-q:a", "2",
             str(out_path),
         ]
         log.debug("    ffmpeg cwd=%s, cmd=%s", os.getcwd(), cmd)
@@ -553,11 +560,12 @@ def convert_book(epub_path: Path) -> Path:
                 f.write(
                     f"file '{abs_p.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
                 )
+        # Re-encode (see render_chapter for the -c copy vs libmp3lame trade-off)
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list.resolve()),
-            "-c", "copy",
+            "-c:a", "libmp3lame", "-q:a", "2",
             str(full_path),
         ]
         log.debug("    ffmpeg (full) cwd=%s, cmd=%s", os.getcwd(), cmd)
