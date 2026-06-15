@@ -67,7 +67,7 @@ cp .env.example .env
 # Edit .env and set TTS_API_KEY
 ```
 
-The defaults are tuned for **OpenRouter + `gpt-4o-mini-tts`** with a **calm British female voice at 1.2× speed**. Tweak to taste — see the file for every knob.
+The defaults are tuned for **OpenRouter + `openai/gpt-4o-mini-tts-2025-12-15`** with a **calm British female voice at 1.2× speed**. Tweak to taste — see the file for every knob.
 
 ### 4. Drop books & run
 
@@ -114,11 +114,11 @@ Every setting lives in `.env` (gitignored). The full list:
 |---|---|---|
 | `TTS_API_KEY` | *(required)* | Your provider API key |
 | `TTS_API_URL` | `https://openrouter.ai/api/v1/audio/speech` | OpenAI-compatible endpoint |
-| `TTS_MODEL` | `openai/gpt-4o-mini-tts` | `openai/tts-1` and `openai/tts-1-hd` also work |
+| `TTS_MODEL` | `openai/gpt-4o-mini-tts-2025-12-15` | `openai/tts-1` and `openai/tts-1-hd` also work |
 | `TTS_VOICE` | `shimmer` | Any of the 13 voices supported by your model |
 | `TTS_SPEED` | `1.2` | 0.25 – 4.0 depending on provider |
 | `TTS_FORMAT` | `mp3` | mp3, opus, aac, flac, wav, pcm |
-| `TTS_INSTRUCTIONS` | British female calm narration | Only sent to `gpt-4o-mini-tts` (steerable prosody) |
+| `TTS_INSTRUCTIONS` | British female calm narration | Only sent to `gpt-4o-mini-tts-2025-12-15` (steerable prosody) |
 | `TTS_CHUNK_CHARS` | `4000` | Per-request character cap |
 | `TTS_MAX_RETRIES` | `4` | Retries on 429/5xx/network errors |
 | `TTS_RETRY_BACKOFF` | `2.0` | Exponential backoff base (seconds) |
@@ -129,7 +129,7 @@ Every setting lives in `.env` (gitignored). The full list:
 
 ### Voice examples
 
-`gpt-4o-mini-tts` ships with 13 voices. For audiobooks, common picks:
+`gpt-4o-mini-tts-2025-12-15` ships with 13 voices. For audiobooks, common picks:
 
 | Voice | Vibe |
 |---|---|
@@ -140,7 +140,7 @@ Every setting lives in `.env` (gitignored). The full list:
 | `ballad` | expressive, narrative — long-form storytelling |
 | `onyx` | deep, male, authoritative — thrillers, noir |
 
-**Note on accents:** none of the `gpt-4o-mini-tts` voices have an explicit "British" tag, but the model's `instructions` field steers prosody *and* accent. The default instructions explicitly request a British female voice. To get an American male voice, for example:
+**Note on accents:** none of the `gpt-4o-mini-tts-2025-12-15` voices have an explicit "British" tag, but the model's `instructions` field steers prosody *and* accent. The default instructions explicitly request a British female voice. To get an American male voice, for example:
 
 ```bash
 TTS_VOICE=onyx
@@ -149,7 +149,7 @@ TTS_INSTRUCTIONS="Speak in a deep, calm American male voice. Pace the narration 
 
 ### Three ready-to-use `.env` files (pick one)
 
-The defaults are tuned for **OpenRouter + `gpt-4o-mini-tts`** with a calm female voice at 1.2× speed. To switch providers, replace the contents of your `.env` with one of the blocks below.
+The defaults are tuned for **OpenRouter + `openai/gpt-4o-mini-tts-2025-12-15`** with a calm female voice at 1.2× speed. To switch providers, replace the contents of your `.env` with one of the blocks below.
 
 **Option 1 — OpenAI direct (simplest, official, $0.30/M chars)**
 
@@ -176,14 +176,14 @@ Get your key at <https://platform.openai.com/api-keys>. Drop the `openai/` prefi
 
 ---
 
-**Option 2 — OpenRouter (cheapest, many model choices, $0.30/M chars on gpt-4o-mini-tts)**
+**Option 2 — OpenRouter (cheapest, many model choices, $0.30/M chars on `gpt-4o-mini-tts-2025-12-15`)**
 
 ```bash
 # .env — OpenRouter
 TTS_PROVIDER=openai_compatible
 TTS_API_URL=https://openrouter.ai/api/v1/audio/speech
 TTS_API_KEY=YOUR_OPENROUTER_KEY_HERE
-TTS_MODEL=openai/gpt-4o-mini-tts
+TTS_MODEL=openai/gpt-4o-mini-tts-2025-12-15
 TTS_VOICE=shimmer
 TTS_SPEED=1.2
 TTS_INSTRUCTIONS="Speak in a calm, warm British female voice. Pace the narration naturally for audiobook listening."
@@ -199,35 +199,22 @@ LOG_LEVEL=INFO
 
 Get your key at <https://openrouter.ai/keys> (prepaid credits, ~$1-2 is enough for most books). The model name needs the `provider/` prefix — that's the only difference from Option 1.
 
-**Confirmed-working OpenRouter TTS models** (verified June 2026, all OpenAI-compatible):
+**Confirmed-working OpenRouter TTS models** (verified June 2026, all on `/v1/audio/speech`):
 
-| Model | OpenRouter ID | Cost (per 1M audio output tokens) | Voices | Notes |
+| Model | OpenRouter ID | Cost (per 1M input / output tokens) | Voices | Notes |
 |---|---|---|---|---|
-| **OpenAI gpt-4o-mini-tts** *(default)* | `openai/gpt-4o-mini-tts` | ~$12 | 13 | Best cost/quality. Steerable prosody via `instructions`. |
-| OpenAI tts-1 | `openai/tts-1` | ~$15 / 1M chars | 9 | Classic, no steerable prosody. |
-| OpenAI tts-1-hd | `openai/tts-1-hd` | ~$30 / 1M chars | 9 | Highest fidelity, slowest. |
-| Google Gemini 2.5 Flash (TTS) | `google/gemini-2.5-flash-preview-tts` | varies | Gemini voice set | Newer, fast, 24 languages. May need to confirm `/audio/speech` support on OpenRouter. |
-| Inworld TTS-1 | `inworld/tts-1` | budget | 6+ | Cheap English TTS, OpenAI-compatible per Inworld docs. |
-| LMNT | `lmnt/lmnt` | budget | varies | Low-latency English TTS, OpenAI-compatible. |
-| Resemble AI | `resemble-ai/chatterbox-turbo` | budget | varies | Open-source-ish model, supports voice cloning. |
-| PlayAI TTS | `playai/tts` | budget | several | Conversational English, may need newer OpenRouter schema. |
-| Kokoro (local-proxy needed) | — | n/a | — | Self-hosted; not on OpenRouter, but works via LocalAI/Ollama proxy. |
+| **Kokoro 82M** *(cheapest)* | `hexgrad/kokoro-82m` | $0.62 in / **$0 out** | 54 | 8 languages. Effectively free audio. Open-weight, fastest cold-start. |
+| **OpenAI gpt-4o-mini-tts** *(default)* | `openai/gpt-4o-mini-tts-2025-12-15` | ~$3 in / ~$12 out | 13 | Best cost/quality among OpenAI voices. Steerable prosody via `instructions`. |
+| Orpheus 3B | `canopylabs/orpheus-3b-0.1-ft` | $7 in / $0 out | 7 | English-only, natural prosody, expressive. |
+| Mistral Voxtral Mini TTS | `mistralai/voxtral-mini-tts-2603` | $16 in / $0 out | varies | Voice cloning, multilingual. |
+| xAI Grok Voice TTS 1.0 | `x-ai/grok-voice-tts-1.0` | $15 in / $0 out | 5 | Inline speech tags (pauses, emphasis). |
+| Microsoft MAI-Voice-2 | `microsoft/mai-voice-2` | $22 in / $0 out | Azure voices | Expressive SSML styles (cheerful, sad, etc.). |
+| Google Gemini 3.1 Flash TTS | `google/gemini-3.1-flash-tts-preview` | $1 in / $20 out | 30+ | 70+ languages, 200+ inline audio tags, 2-speaker support. |
 
 **Heads-up:** OpenRouter's TTS model list changes often. New TTS models are added monthly. Check the live list at:
 - [openrouter.ai/models?modality=text-to-speech](https://openrouter.ai/models?modality=text-to-speech)
-- filter: modality = "Audio" → sort by price
-
-**Model names that should work but are unconfirmed on OpenRouter as of June 2026:**
-
-| Model | OpenRouter ID (try this) | Why unconfirmed |
-|---|---|---|
-| Microsoft Azure Speech (neural voices) | `azure/speech` | Not currently in OpenRouter's audio lineup |
-| Amazon Polly Neural | `amazon/polly-neural` | Not on OpenRouter |
-| Cartesia Sonic | `cartesia/sonic` | Listed but no `/audio/speech` route confirmed |
-| Hume Octave / Voice | `hume/octave` | Hume has its own API, not OpenAI-compatible |
-| Speechify | `speechify/stream` | Listed but pricing unclear |
-
-If you find a new TTS provider on OpenRouter that exposes the OpenAI `/v1/audio/speech` schema, it should work — just set `TTS_MODEL` accordingly.
+- Or query the API: `curl "https://openrouter.ai/api/v1/models?output_modalities=speech"`
+- filter: output modality = "speech" → sort by price
 
 **Tip for very long books:** OpenRouter has rate limits per model. If you hit a 429, the script's built-in retry will back off and continue. For >20-hour books, you may want to lower `TTS_CHUNK_CHARS` to 2000 and add a small `time.sleep(0.5)` between requests to stay under the per-second quota.
 
@@ -281,7 +268,7 @@ ffmpeg -i input.mp3 -filter:a "atempo=1.2" output.mp3
 
 The script does not do this automatically. PRs welcome.
 
-**ElevenLabs pricing (2026):** ~$0.18 per 1000 characters on Starter/Pro. A 3-hour book = ~$30-40, a 10-hour book = ~$100-130. The `multilingual_v2` model is the most expensive; `turbo_v2_5` is ~70% cheaper and still very good. Quality is noticeably better than `gpt-4o-mini-tts` for long-form narration, especially for non-English content.
+**ElevenLabs pricing (2026):** ~$0.18 per 1000 characters on Starter/Pro. A 3-hour book = ~$30-40, a 10-hour book = ~$100-130. The `multilingual_v2` model is the most expensive; `turbo_v2_5` is ~70% cheaper and still very good. Quality is noticeably better than `gpt-4o-mini-tts-2025-12-15` for long-form narration, especially for non-English content.
 
 ### Using a self-hosted model
 
@@ -299,11 +286,12 @@ TTS_INSTRUCTIONS=
 
 ## Cost (rough)
 
-A 3-hour audiobook (≈ 180 000 chars) on `gpt-4o-mini-tts`:
+A 3-hour audiobook (≈ 180 000 chars) on `gpt-4o-mini-tts-2025-12-15`:
 
 | Provider | 3-hour book | 10-hour book |
 |---|---|---|
-| **OpenRouter `gpt-4o-mini-tts`** | **~$1.50** | **~$5.00** |
+| **OpenRouter `kokoro-82m`** | **~$0.001** (effectively free) | **~$0.005** |
+| **OpenRouter `gpt-4o-mini-tts-2025-12-15`** | **~$1.50** | **~$5.00** |
 | OpenAI `gpt-4o-mini-tts` | ~$1.10 | ~$3.70 |
 | OpenAI `tts-1` | ~$2.70 | ~$9.00 |
 | OpenAI `tts-1-hd` | ~$5.40 | ~$18.00 |
@@ -316,7 +304,7 @@ Token-based models bill audio output at ~$12/M tokens. `tts-1` and `tts-1-hd` bi
 ## Limitations
 
 - **No character voices on OpenAI-compatible providers** — single narrator for the whole book. For distinct voices per character, use ElevenLabs (which supports voice cloning) or [Orpheus TTS](https://github.com/canopyai/Orpheus-TTS) (self-hosted).
-- **No SSML on OpenAI-compatible providers** — `gpt-4o-mini-tts` doesn't accept SSML. Use the `instructions` field for prosody hints.
+- **No SSML on OpenAI-compatible providers** — `gpt-4o-mini-tts-2025-12-15` doesn't accept SSML. Use the `instructions` field for prosody hints.
 - **EPUB only** — no MOBI, AZW3, or PDF. Convert first with [Calibre](https://calibre-ebook.com) (`ebook-convert input.mobi output.epub`).
 - **DRM-locked books won't work** — only DRM-free EPUBs.
 - **No resume on crash** — if the run dies mid-book, you have to restart the whole book. (Easiest workaround: rename half-finished books with a `.partial` suffix before re-running.)
