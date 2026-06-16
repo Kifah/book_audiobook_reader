@@ -68,8 +68,8 @@ if "${MLX_PYTHON}" -c "import mlx_audio; print('mlx-audio OK')" 2>/dev/null; the
     echo
     echo "    TTS_PROVIDER=mlx_local"
     echo "    MLX_PYTHON=${MLX_PYTHON}"
-    echo "    MLX_MODEL=mlx-community/orpheus-tts-0.1-finetune-bf16"
-    echo "    MLX_VOICE=tara"
+    echo "    MLX_MODEL=mlx-community/Kokoro-82M-bf16"
+    echo "    MLX_VOICE=af_bella"
     echo "    TTS_SPEED=1.2"
     echo
     echo "  Optional: clear TTS_MODEL and TTS_VOICE — they're ignored"

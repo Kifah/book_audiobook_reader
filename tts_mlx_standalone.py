@@ -26,14 +26,24 @@ script as a subprocess and reads back the generated audio.
       - Other GPU workloads running concurrently
       - macOS power management settings (low-power mode = slower)
 
-First-run model download: 500MB-2GB depending on MLX_MODEL choice.
+First-run model download: 355MB for Kokoro-82M, larger for the bigger models.
 Models are cached in ~/.cache/huggingface/ after first run.
+
+Known-good models (verified to exist on HuggingFace):
+  - mlx-community/Kokoro-82M-bf16   (355 MB, 54 voices, 8 languages, RECOMMENDED)
+  - mlx-community/Spark-TTS-0.5B-bf16  (~1 GB, English + Chinese)
+  - mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16  (~3.5 GB, high quality)
+
+Voice names are model-specific:
+  - Kokoro-82M:   af_bella, am_adam, bf_emma, etc. (see model card)
+  - Spark-TTS:    no voice arg needed, just text
+  - Qwen3-TTS:    voice names per the model card
 
 Usage:
     python3 tts_mlx_standalone.py \\
         --text "Hello, world" \\
-        --model mlx-community/orpheus-tts-0.1-finetune-bf16 \\
-        --voice tara \\
+        --model mlx-community/Kokoro-82M-bf16 \\
+        --voice af_bella \\
         --speed 1.0
 
 Output:
@@ -58,12 +68,12 @@ def main() -> int:
         help="Text to synthesize",
     )
     parser.add_argument(
-        "--model", default="mlx-community/orpheus-tts-0.1-finetune-bf16",
-        help="HuggingFace model ID or local path. Default: Orpheus 1B (high quality)",
+        "--model", default="mlx-community/Kokoro-82M-bf16",
+        help="HuggingFace model ID or local path. Default: Kokoro-82M (smallest, fastest, real).",
     )
     parser.add_argument(
-        "--voice", default="tara",
-        help="Voice name (model-specific). Default: tara",
+        "--voice", default="af_bella",
+        help="Voice name (model-specific). Default: af_bella (Kokoro American female).",
     )
     parser.add_argument(
         "--speed", type=float, default=1.0,
@@ -124,16 +134,27 @@ def main() -> int:
         return 4
 
     # Generate audio
-    # NOTE: mlx-audio's generate() returns a list of result objects.
-    # We grab the first one (we only asked for one text) and extract audio.
-    # The exact API surface depends on the model; for Orpheus, the result
-    # has an `audio` attribute (numpy array) and a `sample_rate` attribute.
+    # NOTE: mlx-audio's generate() signature varies by model. Kokoro takes
+    # (text, voice, speed), Orpheus takes (text, voice, speed), Spark-TTS
+    # takes just (text). We pass voice and speed; if the model doesn't
+    # accept voice, we fall back to a no-voice call.
     try:
         results = model.generate(
             args.text,
             voice=args.voice,
             speed=args.speed,
         )
+    except TypeError:
+        # Model doesn't accept voice/speed kwargs (e.g. Spark-TTS).
+        # Retry with just text.
+        try:
+            results = model.generate(args.text)
+        except Exception as e:
+            print(
+                f"ERROR: generation failed: {e}",
+                file=sys.stderr,
+            )
+            return 5
     except Exception as e:
         print(
             f"ERROR: generation failed: {e}\n"

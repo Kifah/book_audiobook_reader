@@ -181,8 +181,8 @@ Every setting lives in `.env` (gitignored). The full list:
 | `TTS_REQUEST_TIMEOUT` | `180` | Per-request timeout |
 | `TTS_PARALLEL_CHUNKS` | `4` | Concurrent TTS requests per chapter (1 = sequential). 4 is a good default; 8+ may hit rate limits on cloud providers. |
 | `MLX_PYTHON` | *(unset)* | Path to Python in your MLX venv — only used when `TTS_PROVIDER=mlx_local` |
-| `MLX_MODEL` | `mlx-community/orpheus-tts-0.1-finetune-bf16` | HuggingFace MLX model — only used when `TTS_PROVIDER=mlx_local` |
-| `MLX_VOICE` | model-specific | Voice name for the chosen MLX model (e.g. `tara` for Orpheus, `af_bella` for Kokoro) |
+| `MLX_MODEL` | `mlx-community/Kokoro-82M-bf16` | HuggingFace MLX model — only used when `TTS_PROVIDER=mlx_local`. Kokoro is the smallest/most-reliable default. |
+| `MLX_VOICE` | model-specific | Voice name for the chosen MLX model (e.g. `af_bella` for Kokoro, see each model's HuggingFace card) |
 | `INPUT_DIR` | `epubs` | Where to look for `.epub` files |
 | `OUTPUT_DIR` | `audiobooks` | Where to write the zipped output |
 | `LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
@@ -429,16 +429,18 @@ TTS_FORMAT=mp3
 MLX_PYTHON=/Users/YOU/.venvs/mlx-audio/bin/python
 
 # Model: pick one. Bigger = better quality, slower.
-MLX_MODEL=mlx-community/orpheus-tts-0.1-finetune-bf16   # best quality, ~2GB
-# MLX_MODEL=mlx-community/outetts-0.3-500M-bf16        # smaller, faster, ~1GB
-# MLX_MODEL=mlx-community/Kokoro-82M-bf16              # 54 voices, 8 languages, ~500MB
+# Defaults to Kokoro-82M (smallest, real, well-tested).
+MLX_MODEL=mlx-community/Kokoro-82M-bf16   # 54 voices, 8 languages, ~355MB
+# MLX_MODEL=mlx-community/Spark-TTS-0.5B-bf16          # English + Chinese, ~1GB
+# MLX_MODEL=mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16  # high quality, ~3.5GB
 
 # Voice: model-specific. See HuggingFace model page for valid voices.
-MLX_VOICE=tara
+# Kokoro voices: af_bella, am_adam, bf_emma, bm_george, etc.
+MLX_VOICE=af_bella
 TTS_SPEED=1.2
 ```
 
-**Why Orpheus-1B:** best quality-to-size ratio of the MLX community models. Near-ElevenLabs quality for narration, runs at ~1.5x real-time on M5. The other two are smaller alternatives if you want faster or have RAM constraints.
+**Why Kokoro-82M as the default:** it's the smallest (~355MB, fast download), fastest on older Apple Silicon, and has 54 voices in 8 languages. The other two are larger alternatives if you want higher quality and have the disk space / RAM.
 
 **Try it:**
 

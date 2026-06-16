@@ -690,10 +690,10 @@ def _tts_mlx_local(text: str) -> bytes:
 
     Configuration (in .env):
         TTS_PROVIDER=mlx_local
-        MLX_MODEL=mlx-community/orpheus-tts-0.1-finetune-bf16
-        # or: mlx-community/outetts-0.3-500M-bf16 (smaller, faster)
-        # or: mlx-community/Kokoro-82M-bf16 (same as before, just MLX-accelerated)
-        MLX_VOICE=tara   # model-specific voice name
+        MLX_MODEL=mlx-community/Kokoro-82M-bf16   # 54 voices, 8 languages, 355MB (default)
+        # or: mlx-community/Spark-TTS-0.5B-bf16 (English + Chinese, ~1GB)
+        # or: mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16 (high quality, ~3.5GB)
+        MLX_VOICE=af_bella   # Kokoro voice name; see model's HuggingFace card for others
         MLX_PYTHON=~/.venvs/mlx-audio/bin/python  # path to MLX venv Python
     """
     if not MLX_STANDALONE_SCRIPT.exists():
@@ -723,8 +723,8 @@ def _tts_mlx_local(text: str) -> bytes:
             "source ~/.venvs/mlx-audio/bin/activate && pip install mlx-audio"
         )
 
-    model = os.getenv("MLX_MODEL", "mlx-community/orpheus-tts-0.1-finetune-bf16")
-    voice = os.getenv("MLX_VOICE", "tara")
+    model = os.getenv("MLX_MODEL", "mlx-community/Kokoro-82M-bf16")
+    voice = os.getenv("MLX_VOICE", "af_bella")
     speed = float(os.getenv("TTS_SPEED", "1.0"))
 
     proc = subprocess.run(
@@ -1202,7 +1202,16 @@ def convert_book(epub_path: Path) -> Path:
             skipped_existing += 1
             continue
 
-        render_chapter(ch_title, ch["text"], out_path, tmp_dir / f"ch{i:02d}")
+        try:
+            render_chapter(ch_title, ch["text"], out_path, tmp_dir / f"ch{i:02d}")
+        except Exception as e:
+            # If this was a dry-run, tell the user where the sample WOULD have
+            # been written — otherwise they have no idea which folder to look
+            # in. Re-raise so the script still exits non-zero.
+            if DRY_RUN:
+                log.error("DRY RUN — no sample was written (TTS failed: %s)", e)
+                log.error("DRY RUN — expected output path: %s", out_path)
+            raise
         chapter_mp3s.append(out_path)
 
     if CONTINUE_RUN and skipped_existing:
