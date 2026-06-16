@@ -188,7 +188,16 @@ def main() -> int:
         print("ERROR: model.generate() returned no results", file=sys.stderr)
         return 6
 
-    result = results[0]
+    # model.generate() returns an iterator/generator, not a list.
+    # mlx-audio's own generate_audio() does `for i, result in enumerate(results):`
+    # so we follow that pattern: get the first result via next().
+    try:
+        first = next(iter(results))
+    except StopIteration:
+        print("ERROR: model.generate() iterator was empty", file=sys.stderr)
+        return 6
+
+    result = first
     audio = result.audio
     sample_rate = getattr(result, "sample_rate", 24000)
 
