@@ -97,6 +97,13 @@ TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "4"))
 TTS_RETRY_BACKOFF = float(os.getenv("TTS_RETRY_BACKOFF", "2.0"))
 TTS_REQUEST_TIMEOUT = int(os.getenv("TTS_REQUEST_TIMEOUT", "180"))
 
+# Format of intermediate TTS part files saved to disk before chapter concat.
+# For openai_compatible providers (OpenAI, OpenRouter/Kokoro/Orpheus, Gemini),
+# we save raw PCM (24kHz 16-bit mono) — no ffmpeg overhead per chunk.
+# The chapter-level concat encodes all parts to MP3 in a single pass.
+# For ElevenLabs, we save MP3 (their API returns MP3 directly).
+TTS_PART_FORMAT = "pcm" if TTS_PROVIDER == "openai_compatible" else TTS_FORMAT
+
 # Concat strategy for joining TTS-rendered MP3 chunks:
 #   "auto"     - try -c copy (fast, ~1s/chapter) first; on DTS error, fall back
 #                to PCM re-encode (~25s/chapter). Best for most books.
@@ -448,12 +455,13 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
 def _tts_openai_compatible(text: str) -> bytes:
     """
     POST a single text chunk to an OpenAI-compatible /audio/speech endpoint.
-    Returns raw audio bytes (mp3 by default, or TTS_FORMAT).
+    Returns raw PCM bytes (24kHz, 16-bit signed little-endian, mono).
 
-    Some providers (notably Google Gemini TTS) only support `pcm` as a
-    response format, so we always request PCM, then convert to TTS_FORMAT
-    locally with ffmpeg. This is uniform across providers and means we
-    never get a 400 back from "unsupported response_format".
+    All major OpenAI-compatible TTS providers (OpenAI, OpenRouter/Kokoro/
+    Orpheus, Google Gemini) support `response_format="pcm"`. We always
+    request PCM and let the chapter-level concat do the format conversion
+    to MP3 in a single pass, rather than paying ffmpeg overhead on every
+    chunk (144ms × 12 chunks = 1.7s wasted per chapter).
     """
     if not TTS_API_KEY:
         raise RuntimeError("TTS_API_KEY is not set. Copy .env.example to .env and add your key.")
@@ -462,7 +470,7 @@ def _tts_openai_compatible(text: str) -> bytes:
         "model": TTS_MODEL,
         "input": text,
         "voice": TTS_VOICE,
-        "response_format": "pcm",  # all major TTS providers support this
+        "response_format": "pcm",
         "speed": TTS_SPEED,
     }
     # Some providers accept 'instructions' for steerable prosody (gpt-4o-mini-tts)
@@ -482,32 +490,20 @@ def _tts_openai_compatible(text: str) -> bytes:
         method="POST",
     )
     with request.urlopen(req, timeout=TTS_REQUEST_TIMEOUT) as resp:
-        pcm_bytes = resp.read()
-
-    # If the API returned PCM, convert to TTS_FORMAT locally with ffmpeg.
-    # If it returned MP3/etc. directly (which happens with OpenAI and some
-    # other providers), ffmpeg can still convert it cleanly.
-    if TTS_FORMAT == "pcm":
-        return pcm_bytes
-
-    return _pcm_to_format(pcm_bytes, TTS_FORMAT)
+        return resp.read()
 
 
 def _pcm_to_format(pcm_bytes: bytes, out_format: str) -> bytes:
     """Convert raw PCM bytes (24kHz, 16-bit, mono) to the given audio format.
 
-    Uses ffmpeg as a subprocess because we don't want to add numpy/scipy as
-    a dependency for what is essentially one format conversion.
-
-    The PCM signature (24kHz, 16-bit, mono) is the OpenAI/Gemini/most
-    modern TTS API standard. If a provider returns different PCM parameters
-    we'd need to detect them via a probe — for now, hardcode the standard.
+    Kept for compatibility with the ElevenLabs path which may still
+    receive MP3/etc. directly. The openai_compatible path now saves
+    raw PCM and converts at chapter-concat time, which is much faster.
     """
     if not ffmpeg_available():
         raise RuntimeError(
             f"ffmpeg is required to convert PCM to {out_format} but was not found in PATH"
         )
-    # Map TTS_FORMAT to ffmpeg codec. Most are obvious, but document the choice.
     codec_map = {
         "mp3":  ["-c:a", "libmp3lame", "-b:a", TTS_BITRATE],
         "opus": ["-c:a", "libopus", "-b:a", "64k"],
@@ -541,6 +537,69 @@ def _pcm_to_format(pcm_bytes: bytes, out_format: str) -> bytes:
     if not proc.stdout:
         raise RuntimeError(f"ffmpeg PCM->{out_format} returned no audio bytes")
     return proc.stdout
+
+
+def _pcm_chunks_to_mp3(pcm_files: list[Path], out_path: Path) -> None:
+    """Concatenate multiple raw PCM files into a single MP3.
+
+    Fast path for chapter-level concat: open all PCM files, read them in
+    sequence, pipe the combined stream to ffmpeg, encode to MP3 in one
+    pass. This is significantly faster than:
+      (a) per-chunk ffmpeg encode to MP3 + concat demuxer (old PCM code)
+      (b) concat demuxer with .pcm files (doesn't work — demuxer can't
+          infer format)
+      (c) PCM-to-WAV intermediate + WAV-to-MP3 (current concat_mp3_parts
+          slow path)
+
+    Assumes all PCM files share the standard TTS-PCM signature:
+    24kHz, 16-bit signed little-endian, mono. Same as _pcm_to_format.
+    """
+    if not pcm_files:
+        raise ValueError("_pcm_chunks_to_mp3 called with empty pcm_files list")
+    if not ffmpeg_available():
+        raise RuntimeError("ffmpeg required for PCM chunk concat")
+
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "s16le", "-ar", "24000", "-ac", "1",  # input PCM signature
+        "-i", "pipe:0",
+        "-c:a", "libmp3lame", "-b:a", TTS_BITRATE,
+        "-ac", str(TTS_CHANNELS),
+        "-id3v2_version", "3",
+        str(out_path),
+    ]
+    log.debug("    [pcm-chunks] ffmpeg cmd=%s, files=%d", ffmpeg_cmd, len(pcm_files))
+
+    # Read all PCM chunks into memory and pipe to ffmpeg in one shot.
+    # For a 30-min chapter at 24kHz 16-bit mono, the combined PCM is
+    # ~86MB — fits comfortably in RAM and avoids the complexity of
+    # streaming via communicate(input=generator). communicate() doesn't
+    # actually support generators in all Python versions; loading is
+    # simpler and the encoding step is the bottleneck anyway.
+    combined = b"".join(p.read_bytes() for p in pcm_files)
+
+    proc = subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _, stderr_bytes = proc.communicate(input=combined, timeout=300)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, stderr_bytes = proc.communicate()
+        raise RuntimeError(
+            f"PCM chunk concat timed out after 300s. stderr: "
+            f"{stderr_bytes.decode(errors='ignore')[:300]}"
+        )
+    if proc.returncode != 0:
+        stderr_text = (stderr_bytes or b"").decode(errors="ignore")[:300]
+        raise RuntimeError(
+            f"PCM chunk concat failed (exit {proc.returncode}): {stderr_text}"
+        )
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError("PCM chunk concat produced no output file")
 
 
 def _tts_elevenlabs(text: str) -> bytes:
@@ -787,23 +846,40 @@ def render_chapter(title: str, text: str, out_path: Path, tmp_dir: Path) -> None
     for i, chunk in enumerate(chunks, start=1):
         log.info("    [%d/%d]  TTS %d chars…", i, len(chunks), len(chunk))
         audio = tts_one_chunk(chunk)
-        part_path = tmp_dir / f"part_{i:04d}.{TTS_FORMAT}"
+        part_path = tmp_dir / f"part_{i:04d}.{TTS_PART_FORMAT}"
         with open(part_path, "wb") as f:
             f.write(audio)
         part_files.append(part_path)
 
-    # Concatenate. ffmpeg concat-demuxer is the safest no-recode path.
+    # Concatenate parts into a single output file.
     if not part_files:
         log.warning("    No audio parts produced for chapter '%s' — skipping", title)
         return
 
     if len(part_files) == 1:
-        shutil.move(str(part_files[0]), str(out_path))
+        # Single part: if it's already the right format, just move it;
+        # otherwise transcode.
+        single = part_files[0]
+        if TTS_PART_FORMAT == TTS_FORMAT:
+            shutil.move(str(single), str(out_path))
+        else:
+            # Cross-format (e.g. PCM part, MP3 output). Transcode with ffmpeg.
+            _pcm_chunks_to_mp3([single], out_path)
     elif ffmpeg_available():
-        concat_mp3_parts(part_files, out_path, log_obj=log, label=f"chapter '{title}'")
+        if TTS_PART_FORMAT == "pcm" and TTS_FORMAT == "mp3":
+            # Fast path: cat all PCM chunks and encode to MP3 in one pass.
+            _pcm_chunks_to_mp3(part_files, out_path)
+        else:
+            # MP3 or other format: use the standard concat pipeline.
+            concat_mp3_parts(part_files, out_path, log_obj=log, label=f"chapter '{title}'")
     else:
         # Pure-Python fallback: raw byte concat. Works for MP3 because the
         # container has no header — each frame is independently decodable.
+        # Does NOT work for PCM (frames are 16-bit samples with no header).
+        if TTS_PART_FORMAT != "mp3":
+            raise RuntimeError(
+                f"ffmpeg required for {TTS_PART_FORMAT} concat but not found in PATH"
+            )
         log.warning("    ffmpeg not found; doing raw MP3 byte-append")
         with open(out_path, "wb") as out:
             for p in part_files:
