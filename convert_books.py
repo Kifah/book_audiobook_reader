@@ -25,6 +25,7 @@ import unicodedata
 import subprocess
 from pathlib import Path
 from urllib import request, error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from ebooklib import epub, ITEM_DOCUMENT
@@ -96,6 +97,15 @@ TTS_CHUNK_CHARS = int(os.getenv("TTS_CHUNK_CHARS", "4000"))
 TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "4"))
 TTS_RETRY_BACKOFF = float(os.getenv("TTS_RETRY_BACKOFF", "2.0"))
 TTS_REQUEST_TIMEOUT = int(os.getenv("TTS_REQUEST_TIMEOUT", "180"))
+
+# Parallel TTS requests per chapter. Cloud TTS is I/O-bound (waiting on
+# the network), so threads work well — they don't need to release the GIL
+# because most of the time is spent in urlopen(), not Python bytecode.
+# For 12 chunks at 2s each sequential = 24s, with 4 parallel = 6s, with
+# 8 parallel = 3s. Cloud providers typically handle 8-16 concurrent
+# requests fine; above that you may hit rate limits.
+# Set to 1 to disable parallelism (e.g. for rate-limited OpenRouter tiers).
+TTS_PARALLEL = max(1, int(os.getenv("TTS_PARALLEL", "4")))
 
 # Format of intermediate TTS part files saved to disk before chapter concat.
 # For openai_compatible providers (OpenAI, OpenRouter/Kokoro/Orpheus, Gemini),
@@ -821,6 +831,76 @@ def concat_mp3_parts(
             pass
 
 
+def _render_chunks_parallel(
+    chunks: list[str],
+    tmp_dir: Path,
+    workers: int,
+    part_format: str,
+) -> list[Path]:
+    """Render a chapter's TTS chunks in parallel using a thread pool.
+
+    Cloud TTS is I/O-bound (waiting on the network), so threads give a
+    near-linear speedup up to the connection/bandwidth limit. Typical
+    numbers for OpenRouter + Gemini:
+        1 worker:   ~24s for 12 chunks
+        4 workers:  ~6-8s
+        8 workers:  ~3-4s
+       16 workers:  ~2-3s (may hit rate limits)
+
+    Args:
+        chunks: list of text chunks to render.
+        tmp_dir: where to write the .pcm/.mp3 part files.
+        workers: number of concurrent threads.
+        part_format: file extension for the parts (e.g. 'pcm' or 'mp3').
+
+    Returns:
+        List of part file paths in original chunk order (part_0001,
+        part_0002, ...). Order is preserved regardless of completion
+        order, so the concat at the end is correct.
+    """
+    n = len(chunks)
+    indexed_results: dict[int, Path] = {}
+    completed = 0
+    failed: list[Exception] = []
+    t0 = time.perf_counter()
+
+    def _render_one(idx: int, chunk: str) -> tuple[int, Path]:
+        audio = tts_one_chunk(chunk)
+        part_path = tmp_dir / f"part_{idx + 1:04d}.{part_format}"
+        with open(part_path, "wb") as f:
+            f.write(audio)
+        return idx, part_path
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_render_one, i, c): i for i, c in enumerate(chunks)}
+        for future in as_completed(futures):
+            try:
+                idx, path = future.result()
+                indexed_results[idx] = path
+                completed += 1
+                elapsed = time.perf_counter() - t0
+                # Per-chunk progress logging (thread-safe via logging module)
+                log.info(
+                    "    [%d/%d]  TTS done (%.1fs elapsed)",
+                    completed, n, elapsed,
+                )
+            except Exception as e:
+                # Capture the original chunk index for diagnostics.
+                failed.append(e)
+                log.error("    TTS chunk failed: %s", e)
+                # Cancel pending futures; we won't have a complete set.
+                for f in futures:
+                    f.cancel()
+                break
+
+    if failed:
+        # Re-raise the first failure (preserve original exception type)
+        raise failed[0]
+
+    # Return paths in original chunk order so the concat is correct.
+    return [indexed_results[i] for i in range(n)]
+
+
 # ---------------------------------------------------------------------------
 # Chapter → MP3 (chunked + concatenated)
 # ---------------------------------------------------------------------------
@@ -841,15 +921,25 @@ def render_chapter(title: str, text: str, out_path: Path, tmp_dir: Path) -> None
     log.info("  Chapter '%s' → %d chunk(s)", title, len(chunks))
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    part_files: list[Path] = []
 
-    for i, chunk in enumerate(chunks, start=1):
-        log.info("    [%d/%d]  TTS %d chars…", i, len(chunks), len(chunk))
-        audio = tts_one_chunk(chunk)
-        part_path = tmp_dir / f"part_{i:04d}.{TTS_PART_FORMAT}"
-        with open(part_path, "wb") as f:
-            f.write(audio)
-        part_files.append(part_path)
+    if TTS_PARALLEL == 1 or len(chunks) == 1:
+        # Sequential path (no parallelism). Same as before.
+        part_files: list[Path] = []
+        for i, chunk in enumerate(chunks, start=1):
+            log.info("    [%d/%d]  TTS %d chars…", i, len(chunks), len(chunk))
+            audio = tts_one_chunk(chunk)
+            part_path = tmp_dir / f"part_{i:04d}.{TTS_PART_FORMAT}"
+            with open(part_path, "wb") as f:
+                f.write(audio)
+            part_files.append(part_path)
+    else:
+        # Parallel path: dispatch all chunks at once to a thread pool.
+        # Cloud TTS is I/O-bound (waiting on the network), so threads
+        # give a near-linear speedup up to the network/connection limit.
+        log.info("    TTS parallelism: %d workers", TTS_PARALLEL)
+        part_files = _render_chunks_parallel(
+            chunks, tmp_dir, TTS_PARALLEL, TTS_PART_FORMAT
+        )
 
     # Concatenate parts into a single output file.
     if not part_files:
