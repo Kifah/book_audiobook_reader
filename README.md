@@ -241,12 +241,12 @@ Get your key at <https://openrouter.ai/keys> (prepaid credits, ~$1-2 is enough f
 | Model | OpenRouter ID | Cost (per 1M input / output tokens) | Voices | Notes |
 |---|---|---|---|---|
 | **Kokoro 82M** *(cheapest)* | `hexgrad/kokoro-82m` | $0.62 in / **$0 out** | 54 | 8 languages. Effectively free audio. Open-weight, fastest cold-start. |
+| **Google Gemini 3.1 Flash TTS** *(recommended)* | `google/gemini-3.1-flash-tts-preview` | $1 in / $20 out | 30+ | 70+ languages, 200+ inline audio tags, 2-speaker support. **Best text normalization of any TTS model** — barely needs `clean_for_tts()`. |
 | **OpenAI gpt-4o-mini-tts** *(default)* | `openai/gpt-4o-mini-tts-2025-12-15` | ~$3 in / ~$12 out | 13 | Best cost/quality among OpenAI voices. Steerable prosody via `instructions`. |
 | Orpheus 3B | `canopylabs/orpheus-3b-0.1-ft` | $7 in / $0 out | 7 | English-only, natural prosody, expressive. |
 | Mistral Voxtral Mini TTS | `mistralai/voxtral-mini-tts-2603` | $16 in / $0 out | varies | Voice cloning, multilingual. |
 | xAI Grok Voice TTS 1.0 | `x-ai/grok-voice-tts-1.0` | $15 in / $0 out | 5 | Inline speech tags (pauses, emphasis). |
 | Microsoft MAI-Voice-2 | `microsoft/mai-voice-2` | $22 in / $0 out | Azure voices | Expressive SSML styles (cheerful, sad, etc.). |
-| Google Gemini 3.1 Flash TTS | `google/gemini-3.1-flash-tts-preview` | $1 in / $20 out | 30+ | 70+ languages, 200+ inline audio tags, 2-speaker support. |
 
 **Heads-up:** OpenRouter's TTS model list changes often. New TTS models are added monthly. Check the live list at:
 - [openrouter.ai/models?modality=text-to-speech](https://openrouter.ai/models?modality=text-to-speech)
@@ -307,6 +307,58 @@ The script does not do this automatically. PRs welcome.
 
 **ElevenLabs pricing (2026):** ~$0.18 per 1000 characters on Starter/Pro. A 3-hour book = ~$30-40, a 10-hour book = ~$100-130. The `multilingual_v2` model is the most expensive; `turbo_v2_5` is ~70% cheaper and still very good. Quality is noticeably better than `gpt-4o-mini-tts-2025-12-15` for long-form narration, especially for non-English content.
 
+**Option 4 — Google Cloud TTS via OpenRouter (good text normalization, ~$1/M chars)**
+
+Google's TTS models have **excellent text normalization out of the box** — they handle em-dashes, parentheses, abbreviations, numbers, and quote marks far more gracefully than Kokoro, with very few audible breaths. This is the lowest-friction way to get "professional narrator" quality without paying for ElevenLabs.
+
+The catch: Google doesn't expose an OpenAI-compatible TTS endpoint directly, so we route through [OpenRouter](https://openrouter.ai/google), which gives us Google's `gemini-3.1-flash-tts-preview` model on the same `/v1/audio/speech` schema. The `TTS_PROVIDER=openai_compatible` setting (the default) already supports this — you only need to change `TTS_MODEL`.
+
+```bash
+# .env — Google Cloud TTS via OpenRouter
+TTS_PROVIDER=openai_compatible
+TTS_API_URL=https://openrouter.ai/api/v1/audio/speech
+TTS_API_KEY=YOUR_OPENROUTER_KEY_HERE
+TTS_MODEL=google/gemini-3.1-flash-tts-preview
+TTS_FORMAT=mp3
+TTS_CHUNK_CHARS=4000
+TTS_MAX_RETRIES=4
+TTS_RETRY_BACKOFF=2.0
+TTS_REQUEST_TIMEOUT=180
+INPUT_DIR=epubs
+OUTPUT_DIR=audiobooks
+LOG_LEVEL=INFO
+
+# Voice: pass via TTS_VOICE; Gemini TTS supports 30+ voice names.
+# See https://ai.google.dev/gemini-api/docs/speech-generation#voice-options
+TTS_VOICE=Kore   # calm female, good default for non-fiction
+TTS_SPEED=1.2
+```
+
+Popular Gemini TTS voices for audiobooks:
+
+| Voice | Vibe |
+|---|---|
+| `Kore` *(default-ish)* | female, calm, clear — good for non-fiction / academic |
+| `Orus` | male, deep, narrative — classic audiobook feel |
+| `Aoede` | female, bright, expressive — good for fiction |
+| `Charon` | male, British, warm — good for historical / literary |
+| `Fenrir` | male, mid-range, neutral — versatile |
+| `Puck` | male, energetic — good for younger audiences / dialogue-heavy |
+
+You can list all available voices with:
+
+```bash
+curl -s "https://ai.google.dev/gemini-api/docs/speech-generation" | grep -oE '`[A-Z][a-z]+`' | sort -u
+```
+
+**Why this is worth trying if you came from Kokoro:**
+
+The `clean_for_tts()` pass still helps (especially the em-dash and parentheses normalization), but Google's TTS engine does most of the heavy lifting itself. If you were at ~4% weird pauses with Kokoro, expect <1% with Gemini TTS — and the `clean_for_tts` regexes become "nice to have" rather than "essential".
+
+**Pricing (2026):** OpenRouter charges ~$1/M output characters for `gemini-3.1-flash-tts-preview`. A 3-hour book = ~$2-3, a 10-hour book = ~$7-10. Substantially cheaper than ElevenLabs, more expensive than Kokoro (which is $0). The quality/price tradeoff sits between OpenAI `gpt-4o-mini-tts` and ElevenLabs `eleven_turbo_v2_5`.
+
+**Want to use Google Cloud TTS directly (not via OpenRouter)?** That requires Google's native REST API (`/v1/text:synthesize`) with OAuth 2.0 or a Google Cloud API key, and isn't OpenAI-compatible. The script doesn't support it natively yet — PRs welcome. For most audiobook use cases, the OpenRouter route is simpler and gives the same underlying model.
+
 ### Using a self-hosted model
 
 Any OpenAI-compatible audio endpoint will work. Example for [Kokoro-82M](https://github.com/remsky/Kokoro-82M) via a LocalAI-style proxy:
@@ -329,12 +381,17 @@ A 3-hour audiobook (≈ 180 000 chars) on `gpt-4o-mini-tts-2025-12-15`:
 |---|---|---|
 | **OpenRouter `kokoro-82m`** | **~$0.001** (effectively free) | **~$0.005** |
 | **OpenRouter `gpt-4o-mini-tts-2025-12-15`** | **~$1.50** | **~$5.00** |
+| **OpenRouter `google/gemini-3.1-flash-tts-preview`** | **~$0.20** | **~$0.60** |
 | OpenAI `gpt-4o-mini-tts` | ~$1.10 | ~$3.70 |
 | OpenAI `tts-1` | ~$2.70 | ~$9.00 |
 | OpenAI `tts-1-hd` | ~$5.40 | ~$18.00 |
+| ElevenLabs `turbo_v2_5` | ~$30 | ~$100 |
+| ElevenLabs `multilingual_v2` | ~$32 | ~$108 |
 | Self-hosted (Kokoro) | **$0** (your GPU) | **$0** |
 
 Token-based models bill audio output at ~$12/M tokens. `tts-1` and `tts-1-hd` bill per character ($15 and $30 per million).
+
+**Sweet spot for non-fiction audiobooks:** Google Gemini TTS via OpenRouter. ~$0.20 for a 3-hour book, much better text normalization than Kokoro, no ElevenLabs-tier pricing.
 
 ---
 
