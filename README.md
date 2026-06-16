@@ -409,14 +409,27 @@ Or do it manually:
 python3 -m venv ~/.venvs/mlx-audio
 source ~/.venvs/mlx-audio/bin/activate
 
-# 2. Install mlx-audio
-pip install mlx-audio
+# 2. Install mlx-audio and Kokoro dependencies
+pip install mlx-audio misaki num2words spacy phonemizer
+python -m spacy download en_core_web_sm
 
-# 3. Find the venv Python path (you'll need it for .env)
+# 3. Install espeak-ng (system dependency for phonemizer)
+brew install espeak-ng
+
+# 4. Find the venv Python path (you'll need it for .env)
 which python
 # Example output: /Users/you/.venvs/mlx-audio/bin/python
 deactivate
 ```
+
+**Note on dependencies:** The Kokoro model requires several text processing libraries:
+- `misaki` - Text normalization and processing
+- `num2words` - Number-to-words conversion
+- `spacy` + `en_core_web_sm` - Natural language processing
+- `phonemizer` - Phoneme conversion
+- `espeak-ng` - System library for phoneme generation (installed via Homebrew)
+
+The automated setup script ([`./scripts/setup_mlx.sh`](scripts/setup_mlx.sh)) installs all of these automatically.
 
 **.env configuration:**
 
@@ -509,6 +522,60 @@ Prices are per **1M characters of generated audio**. A 3-hour audiobook ≈ 180 
 - **DRM-locked books won't work** — only DRM-free EPUBs.
 - **Resume on crash** — use `--continue` (or `--resume`) to pick up where an aborted run left off. Skips already-rendered chapters; only renders the missing ones.
 - **ElevenLabs speed control is post-process only** — ElevenLabs' API doesn't accept a `speed` parameter. See the ElevenLabs section for the ffmpeg workaround.
+
+---
+
+## Troubleshooting
+
+### MLX TTS Issues
+
+**Error: `ModuleNotFoundError: No module named 'misaki'`**
+
+The Kokoro model requires additional dependencies. Run the setup script again:
+```bash
+./scripts/setup_mlx.sh
+```
+
+Or install manually:
+```bash
+~/.venvs/mlx-audio/bin/pip install misaki num2words spacy phonemizer
+~/.venvs/mlx-audio/bin/python -m spacy download en_core_web_sm
+brew install espeak-ng
+```
+
+**Error: `ModuleNotFoundError: No module named 'phonemizer'` or espeak-ng errors**
+
+The `phonemizer` package requires the `espeak-ng` system library:
+```bash
+brew install espeak-ng
+```
+
+On Linux:
+```bash
+sudo apt-get install espeak-ng  # Debian/Ubuntu
+sudo yum install espeak-ng      # RHEL/CentOS
+```
+
+**MLX TTS is slow or fails on first run**
+
+First run downloads model weights (~355MB for Kokoro-82M). This is normal and only happens once. Subsequent runs use cached weights from `~/.cache/huggingface/`.
+
+**"MLX requires Apple Silicon" error**
+
+MLX only works on Apple Silicon Macs (M1/M2/M3/M4/M5). On Intel Macs, Linux, or Windows, use cloud TTS instead:
+```bash
+# In .env
+TTS_PROVIDER=openai_compatible
+TTS_API_URL=https://openrouter.ai/api/v1/audio/speech
+TTS_API_KEY=your_key_here
+```
+
+**ValueError: Shapes cannot be broadcast (MLX inference error)**
+
+If you see shape mismatch errors during TTS generation, this is a known issue with certain mlx-audio versions. Try:
+1. Update mlx-audio: `~/.venvs/mlx-audio/bin/pip install --upgrade mlx-audio`
+2. If the issue persists, switch to a cloud provider temporarily while the MLX team fixes the model
+3. Check the [mlx-audio GitHub issues](https://github.com/ml-explore/mlx-audio/issues) for updates
 
 ---
 

@@ -57,6 +57,31 @@ fi
 echo "==> Installing mlx-audio (this may take ~30s)"
 "${MLX_PYTHON}" -m pip install --quiet --upgrade mlx-audio
 
+# Install Kokoro model dependencies (required for text processing)
+echo "==> Installing Kokoro dependencies (misaki, spacy, phonemizer)"
+"${MLX_PYTHON}" -m pip install --quiet misaki num2words spacy phonemizer
+
+# Download spacy English model
+echo "==> Downloading spacy English model (en_core_web_sm)"
+"${MLX_PYTHON}" -m spacy download en_core_web_sm --quiet 2>/dev/null || true
+
+# Check for espeak-ng (system dependency required by phonemizer)
+echo "==> Checking for espeak-ng"
+if ! command -v espeak-ng &> /dev/null; then
+    echo "    espeak-ng not found — installing via Homebrew"
+    if command -v brew &> /dev/null; then
+        brew install espeak-ng
+    else
+        echo
+        echo "ERROR: Homebrew not found. Install espeak-ng manually:" >&2
+        echo "  brew install espeak-ng" >&2
+        echo "Or download from: https://github.com/espeak-ng/espeak-ng" >&2
+        exit 1
+    fi
+else
+    echo "    espeak-ng already installed"
+fi
+
 # Smoke test
 echo "==> Running smoke test"
 if ! "${MLX_PYTHON}" -c "import mlx_audio; print('mlx-audio OK')" 2>/dev/null; then
@@ -67,6 +92,16 @@ if ! "${MLX_PYTHON}" -c "import mlx_audio; print('mlx-audio OK')" 2>/dev/null; t
     exit 1
 fi
 echo "    mlx-audio OK"
+
+# Test Kokoro dependencies
+echo "==> Testing Kokoro dependencies"
+if ! "${MLX_PYTHON}" -c "import misaki, spacy, phonemizer; print('Kokoro dependencies OK')" 2>/dev/null; then
+    echo
+    echo "WARNING: Some Kokoro dependencies failed to import." >&2
+    echo "The script may still work, but Kokoro model might fail." >&2
+else
+    echo "    Kokoro dependencies OK"
+fi
 
 # ── Auto-fix .env ─────────────────────────────────────────────────────────
 # Migrates the .env in the project that called this script. Fixes:
@@ -135,11 +170,11 @@ PYEOF
         fi
     }
 
-    set_env_var TTS_PROVIDER "mlx_local"
+    # Only set MLX-specific variables, don't force TTS_PROVIDER
+    # (user should manually set TTS_PROVIDER=mlx_local when ready to use it)
     set_env_var MLX_PYTHON   "${MLX_PYTHON}"
     set_env_var MLX_MODEL    "mlx-community/Kokoro-82M-bf16"
     set_env_var MLX_VOICE    "af_bella"
-    set_env_var TTS_SPEED    "1.2"
 
     if [[ ${changed} -eq 0 ]]; then
         echo "    .env already correct — no changes"
@@ -153,18 +188,23 @@ fi
 
 echo
 echo "============================================================"
-echo "  MLX TTS is ready."
+echo "  MLX TTS dependencies installed successfully!"
 echo
-echo "  .env should now contain:"
-echo "    TTS_PROVIDER=mlx_local"
+echo "  .env now contains MLX configuration:"
 echo "    MLX_PYTHON=${MLX_PYTHON}"
 echo "    MLX_MODEL=mlx-community/Kokoro-82M-bf16"
 echo "    MLX_VOICE=af_bella"
-echo "    TTS_SPEED=1.2"
+echo
+echo "  NOTE: mlx-audio 0.4.4 currently has a model bug."
+echo "  To use MLX local TTS, manually set in .env:"
+echo "    TTS_PROVIDER=mlx_local"
+echo
+echo "  Or use cloud TTS (recommended until MLX bug is fixed):"
+echo "    TTS_PROVIDER=openai_compatible"
 echo
 echo "  First TTS call will download the model (~355 MB, ~30s)."
 echo "  Subsequent runs: ~3-4s per chapter on M5."
 echo
-echo "  Run a sample now:"
+echo "  Test with cloud TTS:"
 echo "    python3 convert_books.py --dry-run"
 echo "============================================================"
