@@ -398,6 +398,13 @@ These are rough — actual speed varies with model size, chunk length, and what 
 **Setup (one-time, ~5 minutes):**
 
 ```bash
+# Automated (recommended): does all the steps below + smoke test
+./scripts/setup_mlx.sh
+```
+
+Or do it manually:
+
+```bash
 # 1. Create an isolated venv (keep MLX out of your main project venv)
 python3 -m venv ~/.venvs/mlx-audio
 source ~/.venvs/mlx-audio/bin/activate
