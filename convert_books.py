@@ -726,6 +726,12 @@ def _tts_mlx_local(text: str) -> bytes:
     model = os.getenv("MLX_MODEL", "mlx-community/Kokoro-82M-bf16")
     voice = os.getenv("MLX_VOICE", "af_bella")
     speed = float(os.getenv("TTS_SPEED", "1.0"))
+    # MLX_LANG: language code for Kokoro (default "a" = American English).
+    # This is required because mlx-audio 0.2.10's KokoroPipeline ALIASES dict
+    # does not include "en", so the default lang_code="en" raises:
+    #   AssertionError: ('en', {'a': 'American English', 'b': 'British English', ...})
+    # See https://github.com/Blaizzy/mlx-audio/issues/378
+    lang = os.getenv("MLX_LANG", "a")
 
     proc = subprocess.run(
         [
@@ -735,15 +741,19 @@ def _tts_mlx_local(text: str) -> bytes:
             "--model", model,
             "--voice", voice,
             "--speed", str(speed),
+            "--lang", lang,
         ],
         capture_output=True,
         text=True,
         timeout=180,
     )
     if proc.returncode != 0:
+        # Print full stderr (truncated to 5000 chars to avoid huge logs).
+        # The standalone script now includes traceback.format_exc() in its
+        # error messages, so the user can see the exact failure.
         raise RuntimeError(
             f"MLX TTS failed (exit {proc.returncode}): "
-            f"{proc.stderr.strip()[:500]}"
+            f"{proc.stderr.strip()[:5000]}"
         )
     # The standalone script writes PCM bytes to a temp file and prints the
     # path on stdout. This keeps the JSON-control-plane separate from

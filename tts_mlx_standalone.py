@@ -80,6 +80,13 @@ def main() -> int:
         help="Speech speed multiplier (0.5-2.0). Default: 1.0",
     )
     parser.add_argument(
+        "--lang", default="a",
+        help="Language code (Kokoro only). Default: 'a' (American English). "
+             "Other options: 'b' (British), 'e' (Spanish), 'f' (French), "
+             "'h' (Hindi), 'i' (Italian), 'p' (Portuguese), 'j' (Japanese), "
+             "'z' (Mandarin). Ignored by non-Kokoro models.",
+    )
+    parser.add_argument(
         "--temp-dir", default=None,
         help="Where to write the temporary PCM file. Default: system temp",
     )
@@ -135,31 +142,44 @@ def main() -> int:
 
     # Generate audio
     # NOTE: mlx-audio's generate() signature varies by model. Kokoro takes
-    # (text, voice, speed), Orpheus takes (text, voice, speed), Spark-TTS
-    # takes just (text). We pass voice and speed; if the model doesn't
-    # accept voice, we fall back to a no-voice call.
+    # (text, voice, speed, lang_code), Orpheus takes (text, voice, speed),
+    # Spark-TTS takes just (text). We pass voice and speed; if the model
+    # doesn't accept voice, we fall back to a no-voice call.
+    #
+    # CRITICAL Kokoro note (mlx-audio 0.2.10): KokoroPipeline's ALIASES
+    # dict does not include "en", so the default lang_code="en" triggers:
+    #   AssertionError: ('en', {'a': 'American English', 'b': 'British English', ...})
+    # We pass lang_code="a" (American English) explicitly. See:
+    # https://github.com/Blaizzy/mlx-audio/issues/378
+    def _generate(text, **kwargs):
+        """Call model.generate with voice+speed+lang_code, fall back to text-only."""
+        for attempt in [
+            {"voice": args.voice, "speed": args.speed, "lang_code": args.lang},
+            {"voice": args.voice, "speed": args.speed},
+            {"lang_code": args.lang},
+            {},
+        ]:
+            try:
+                return model.generate(text, **attempt)
+            except TypeError as e:
+                # Some kwarg wasn't accepted. Try the next attempt.
+                continue
+        # Final fallback: just text
+        return model.generate(text)
+
     try:
-        results = model.generate(
-            args.text,
-            voice=args.voice,
-            speed=args.speed,
-        )
-    except TypeError:
-        # Model doesn't accept voice/speed kwargs (e.g. Spark-TTS).
-        # Retry with just text.
-        try:
-            results = model.generate(args.text)
-        except Exception as e:
-            print(
-                f"ERROR: generation failed: {e}",
-                file=sys.stderr,
-            )
-            return 5
+        results = _generate(args.text)
     except Exception as e:
+        import traceback
         print(
-            f"ERROR: generation failed: {e}\n"
-            f"  The voice name {args.voice!r} may not be valid for this model.\n"
-            f"  Check the model's HuggingFace page for the list of supported voices.",
+            f"ERROR: generation failed: {type(e).__name__}: {e}\n"
+            f"  Model: {args.model}\n"
+            f"  Voice: {args.voice!r}\n"
+            f"  Text length: {len(args.text)} chars\n"
+            f"  The voice name may not be valid for this model.\n"
+            f"  Check the model's HuggingFace page for supported voices.\n"
+            f"\n"
+            f"  Full traceback:\n{traceback.format_exc()}",
             file=sys.stderr,
         )
         return 5
