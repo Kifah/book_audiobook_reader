@@ -13,7 +13,7 @@ epubs/  ──►  convert_books.py  ──►  audiobooks/<book>.zip
 1. **Reads** every `.epub` you drop in `epubs/`
 2. **Extracts** chapters in reading order, stripping HTML
 3. **Chunks** each chapter into ~4 000-character pieces (sentence-aware, never mid-sentence)
-4. **Calls** your TTS endpoint (OpenRouter by default) for each chunk
+4. **Calls** your TTS endpoint for each chunk — in parallel by default (4 workers), so a 10-hour book finishes in ~25 min instead of ~85
 5. **Concatenates** the resulting MP3s with `ffmpeg` (no re-encoding, no quality loss)
 6. **Zips** the per-chapter MP3s + a single full-book MP3 into `audiobooks/<book-slug>.zip`
 
@@ -35,13 +35,44 @@ audiobooks/
 
 ## Why
 
-I wanted to listen to my ebook library on the go without giving Audible my credit card, and I already had an OpenRouter account. The script took about 200 lines of Python.
+I wanted to listen to my ebook library on the go without giving Audible my credit card, and I already had an OpenRouter account. The script started as about 200 lines of Python and has grown to handle a few real-world frictions: ffmpeg chapter joins, sentence-aware chunking, resume after crash, parallel TTS requests, and the rough edges of `clean_for_tts()` text normalization.
 
 It's deliberately **provider-agnostic** — anything that speaks the OpenAI `/v1/audio/speech` schema works:
 
 - [OpenRouter](https://openrouter.ai) (default — one account, many TTS models)
 - [OpenAI](https://platform.openai.com) directly
 - Self-hosted gateways like [LocalAI](https://localai.io), [Ollama](https://ollama.com) (with a TTS adapter), or [Kokoro](https://github.com/remsky/Kokoro-82M) behind an OpenAI-compatible proxy
+
+---
+
+## Platform support
+
+The script itself is **pure Python + ffmpeg** and runs anywhere Python 3.10+ runs. The constraints come from which **TTS provider** you choose, not from the script. Here's the honest matrix:
+
+| Platform | `openai_compatible` (OpenRouter, OpenAI, etc.) | `elevenlabs` | `mlx_local` |
+|---|---|---|---|
+| **macOS Apple Silicon** (M1/M2/M3/M4/M5) | ✅ | ✅ | ✅ **best option** |
+| **macOS Intel** (pre-2020) | ✅ | ✅ | ❌ MLX requires Apple Silicon |
+| **Linux** (x86_64, any distro) | ✅ | ✅ | ❌ MLX is Apple-only |
+| **Linux** (ARM64, e.g. Raspberry Pi, Graviton) | ✅ | ✅ | ❌ |
+| **Windows** 10/11 (x86_64) | ✅ | ✅ | ❌ |
+| **Windows** (ARM64, Surface Pro X etc.) | ✅ | ✅ | ❌ |
+
+**What this means in practice:**
+
+- **Apple Silicon Mac users** get the best deal: any cloud provider works, and MLX local gives you **free, fast** TTS that beats cloud in cost/quality. This is where the project shines.
+- **Linux / Windows / Intel Mac users** have a smaller menu but it's still excellent: OpenRouter `gemini-2.5-pro-preview-tts` via OpenAI-compatible is ~$0.20 for a 3-hour book, and runs from any Docker container, headless server, CI runner, or your laptop. The script has no GUI, no Apple-only deps, no Metal calls — it just makes HTTPS requests and shells out to ffmpeg.
+- **CI / server / NAS** use cases: install Python + ffmpeg, set `TTS_API_KEY` and `TTS_PROVIDER=openai_compatible`, done. No GPU, no Apple Silicon, no problem.
+
+**For MLX specifically** (Apple Silicon only):
+
+- Requires macOS 13.5+ on M1/M2/M3/M4/M5
+- 8 GB RAM minimum, 16 GB recommended for the larger Orpheus model
+- Speed scales with chip: M5 is ~3-4s/chapter, M1 is ~10-15s/chapter. See [Option 5](#option-5--local-mlx-tts-on-apple-silicon-free-0m-fast-on-m-series) for the full per-chip table.
+- First run downloads the model weights (~500 MB – 2 GB)
+- If you try `TTS_PROVIDER=mlx_local` on Linux/Windows/Intel Mac, the script exits with a clear "MLX requires Apple Silicon — use TTS_PROVIDER=openai_compatible instead" error, no stack trace
+
+**For other hardware (no GPU, ARM servers, etc.):** the cloud TTS providers work identically on any platform. The bottleneck is network latency to the provider, not your local hardware.
 
 ---
 
@@ -79,6 +110,8 @@ python3 convert_books.py
 
 That's it. Watch the logs scroll by, grab your zip from `audiobooks/` when it's done.
 
+> **Speed:** chapters are rendered with 4 parallel TTS workers by default (`TTS_PARALLEL_CHUNKS=4`), so a typical 10-hour book finishes in ~25 minutes instead of ~85. On Apple Silicon (M1+) you can skip the API entirely and run **fully local** with `TTS_PROVIDER=mlx_local` — see [Local TTS on Apple Silicon (MLX)](#local-tts-on-apple-silicon-mlx) for setup.
+
 ### Try a sample first (dry-run)
 
 Before committing to a full book conversion (and burning through a few dollars of TTS credits), render a short sample. `--dry-run` makes the script render only the first ~30s of the first chapter's text and stop. No zip, no full book — just one MP3 in `audiobooks/dry-run/<book>/chapters/`.
@@ -94,29 +127,14 @@ python3 convert_books.py --dry-run --dry-run-seconds 60 --book "The Ancient Citi
 python3 convert_books.py --list
 ```
 
-### Resume an aborted run (`--continue`)
-
-If a full-book conversion is interrupted (Ctrl-C, crash, network outage, kicked offline), don't restart from scratch — pick up where you left off:
-
-```bash
-# Run as normal, get interrupted
-python3 convert_books.py
-# ... Ctrl-C mid-book ...
-
-# Resume — only renders missing chapters, keeps everything else
-python3 convert_books.py --continue
-# or equivalently
-python3 convert_books.py --resume
-```
 **What it does (dry-run):**
-
 - Picks the first chapter with real text (skips blank title pages)
 - Cuts to roughly `--dry-run-seconds` worth of characters (sentence-aware)
-- Sends **1 TTS API call** (cheap — ~$0.001 on OpenRouter, ~$0.05 on ElevenLabs)
+- Sends **1 TTS API call** (cheap — ~$0.001 on OpenRouter, ~$0.05 on ElevenLabs, $0 on MLX local)
 - Writes a single MP3 + a `DRY-RUN.md` explaining what it did
 - Exits without touching anything else
 
-**Heads-up:** dry-run STILL uses your real TTS key (1 API call). If you want a true "no-cost" preview first, see [Voice examples](#voice-examples) below for raw API snippets you can paste into your terminal.
+**Heads-up:** dry-run STILL uses your real TTS key (1 API call) for cloud providers. For `TTS_PROVIDER=mlx_local` it's free.
 
 ### Resume an aborted run (`--continue`)
 
@@ -149,7 +167,8 @@ Every setting lives in `.env` (gitignored). The full list:
 
 | Var | Default | Notes |
 |---|---|---|
-| `TTS_API_KEY` | *(required)* | Your provider API key |
+| `TTS_PROVIDER` | `openai_compatible` | `openai_compatible` (default — any OpenAI-speech-compatible endpoint) · `elevenlabs` · `mlx_local` (Apple Silicon only) |
+| `TTS_API_KEY` | *(required)* | Your provider API key (not needed for `mlx_local`) |
 | `TTS_API_URL` | `https://openrouter.ai/api/v1/audio/speech` | OpenAI-compatible endpoint |
 | `TTS_MODEL` | `openai/gpt-4o-mini-tts-2025-12-15` | `openai/tts-1` and `openai/tts-1-hd` also work |
 | `TTS_VOICE` | `shimmer` | Any of the 13 voices supported by your model |
@@ -160,6 +179,10 @@ Every setting lives in `.env` (gitignored). The full list:
 | `TTS_MAX_RETRIES` | `4` | Retries on 429/5xx/network errors |
 | `TTS_RETRY_BACKOFF` | `2.0` | Exponential backoff base (seconds) |
 | `TTS_REQUEST_TIMEOUT` | `180` | Per-request timeout |
+| `TTS_PARALLEL_CHUNKS` | `4` | Concurrent TTS requests per chapter (1 = sequential). 4 is a good default; 8+ may hit rate limits on cloud providers. |
+| `MLX_PYTHON` | *(unset)* | Path to Python in your MLX venv — only used when `TTS_PROVIDER=mlx_local` |
+| `MLX_MODEL` | `mlx-community/orpheus-tts-0.1-finetune-bf16` | HuggingFace MLX model — only used when `TTS_PROVIDER=mlx_local` |
+| `MLX_VOICE` | model-specific | Voice name for the chosen MLX model (e.g. `tara` for Orpheus, `af_bella` for Kokoro) |
 | `INPUT_DIR` | `epubs` | Where to look for `.epub` files |
 | `OUTPUT_DIR` | `audiobooks` | Where to write the zipped output |
 | `LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
@@ -236,22 +259,22 @@ LOG_LEVEL=INFO
 
 Get your key at <https://openrouter.ai/keys> (prepaid credits, ~$1-2 is enough for most books). The model name needs the `provider/` prefix — that's the only difference from Option 1.
 
-**Confirmed-working OpenRouter TTS models** (verified June 2026, all on `/v1/audio/speech`):
+**Confirmed-working OpenRouter TTS models** (all on `/v1/audio/speech` — check the live list at <https://openrouter.ai/models?modality=text-to-speech> for current prices, as they change often):
 
-| Model | OpenRouter ID | Cost (per 1M input / output tokens) | Voices | Notes |
+| Model | OpenRouter ID | Cost (per 1M chars audio) | Voices | Notes |
 |---|---|---|---|---|
-| **Kokoro 82M** *(cheapest)* | `hexgrad/kokoro-82m` | $0.62 in / **$0 out** | 54 | 8 languages. Effectively free audio. Open-weight, fastest cold-start. |
-| **Google Gemini 3.1 Flash TTS** *(recommended)* | `google/gemini-3.1-flash-tts-preview` | $1 in / $20 out | 30+ | 70+ languages, 200+ inline audio tags, 2-speaker support. **Best text normalization of any TTS model** — barely needs `clean_for_tts()`. |
-| **OpenAI gpt-4o-mini-tts** *(default)* | `openai/gpt-4o-mini-tts-2025-12-15` | ~$3 in / ~$12 out | 13 | Best cost/quality among OpenAI voices. Steerable prosody via `instructions`. |
-| Orpheus 3B | `canopylabs/orpheus-3b-0.1-ft` | $7 in / $0 out | 7 | English-only, natural prosody, expressive. |
-| Mistral Voxtral Mini TTS | `mistralai/voxtral-mini-tts-2603` | $16 in / $0 out | varies | Voice cloning, multilingual. |
-| xAI Grok Voice TTS 1.0 | `x-ai/grok-voice-tts-1.0` | $15 in / $0 out | 5 | Inline speech tags (pauses, emphasis). |
-| Microsoft MAI-Voice-2 | `microsoft/mai-voice-2` | $22 in / $0 out | Azure voices | Expressive SSML styles (cheerful, sad, etc.). |
+| **Kokoro 82M** *(cheapest)* | `hexgrad/kokoro-82m` | ~$0.62 | 54 | 8 languages. Open-weight, fastest cold-start. |
+| **Google Gemini 2.5 Pro TTS** | `google/gemini-2.5-pro-preview-tts` | ~$1 | 30+ | 70+ languages, 200+ inline audio tags, 2-speaker support. **Best text normalization of any TTS model** — barely needs `clean_for_tts()`. |
+| **Google Gemini Flash TTS** | `google/gemini-2.5-flash-preview-tts` | ~$0.30 | 30+ | Cheaper Gemini, slightly lower quality. |
+| **OpenAI gpt-4o-mini-tts** | `openai/gpt-4o-mini-tts-2025-12-15` | ~$3 | 13 | Best cost/quality among OpenAI voices. Steerable prosody via `instructions`. |
+| Orpheus 3B | `canopylabs/orpheus-3b-0.1-ft` | ~$7 | 7 | English-only, natural prosody, expressive. |
+| Mistral Voxtral Mini TTS | `mistralai/voxtral-mini-tts-2603` | varies | varies | Voice cloning, multilingual. |
+| xAI Grok Voice TTS 1.0 | `x-ai/grok-voice-tts-1.0` | ~$15 | 5 | Inline speech tags (pauses, emphasis). |
+| Microsoft MAI-Voice-2 | `microsoft/mai-voice-2` | ~$22 | Azure voices | Expressive SSML styles (cheerful, sad, etc.). |
 
-**Heads-up:** OpenRouter's TTS model list changes often. New TTS models are added monthly. Check the live list at:
-- [openrouter.ai/models?modality=text-to-speech](https://openrouter.ai/models?modality=text-to-speech)
-- Or query the API: `curl "https://openrouter.ai/api/v1/models?output_modalities=speech"`
-- filter: output modality = "speech" → sort by price
+**Heads-up:** OpenRouter's TTS model list and prices change often. New TTS models are added monthly. Check the live list at:
+- <https://openrouter.ai/models?modality=text-to-speech>
+- Or query the API: `curl "https://openrouter.ai/api/v1/models?output_modalities=speech"` (filter: output modality = "speech", sort by price)
 
 **Tip for very long books:** OpenRouter has rate limits per model. If you hit a 429, the script's built-in retry will back off and continue. For >20-hour books, you may want to lower `TTS_CHUNK_CHARS` to 2000 and add a small `time.sleep(0.5)` between requests to stay under the per-second quota.
 
@@ -307,18 +330,18 @@ The script does not do this automatically. PRs welcome.
 
 **ElevenLabs pricing (2026):** ~$0.18 per 1000 characters on Starter/Pro. A 3-hour book = ~$30-40, a 10-hour book = ~$100-130. The `multilingual_v2` model is the most expensive; `turbo_v2_5` is ~70% cheaper and still very good. Quality is noticeably better than `gpt-4o-mini-tts-2025-12-15` for long-form narration, especially for non-English content.
 
-**Option 4 — Google Cloud TTS via OpenRouter (good text normalization, ~$1/M chars)**
+**Option 4 — Google Gemini TTS via OpenRouter (best text normalization, ~$1/M chars)**
 
 Google's TTS models have **excellent text normalization out of the box** — they handle em-dashes, parentheses, abbreviations, numbers, and quote marks far more gracefully than Kokoro, with very few audible breaths. This is the lowest-friction way to get "professional narrator" quality without paying for ElevenLabs.
 
-The catch: Google doesn't expose an OpenAI-compatible TTS endpoint directly, so we route through [OpenRouter](https://openrouter.ai/google), which gives us Google's `gemini-3.1-flash-tts-preview` model on the same `/v1/audio/speech` schema. The `TTS_PROVIDER=openai_compatible` setting (the default) already supports this — you only need to change `TTS_MODEL`.
+The catch: Google doesn't expose an OpenAI-compatible TTS endpoint directly, so we route through [OpenRouter](https://openrouter.ai/google), which gives us Google's Gemini TTS models on the same `/v1/audio/speech` schema. The `TTS_PROVIDER=openai_compatible` setting (the default) already supports this — you only need to change `TTS_MODEL`.
 
 ```bash
-# .env — Google Cloud TTS via OpenRouter
+# .env — Google Gemini TTS via OpenRouter
 TTS_PROVIDER=openai_compatible
 TTS_API_URL=https://openrouter.ai/api/v1/audio/speech
 TTS_API_KEY=YOUR_OPENROUTER_KEY_HERE
-TTS_MODEL=google/gemini-3.1-flash-tts-preview
+TTS_MODEL=google/gemini-2.5-pro-preview-tts
 TTS_FORMAT=mp3
 TTS_CHUNK_CHARS=4000
 TTS_MAX_RETRIES=4
@@ -329,7 +352,7 @@ OUTPUT_DIR=audiobooks
 LOG_LEVEL=INFO
 
 # Voice: pass via TTS_VOICE; Gemini TTS supports 30+ voice names.
-# See https://ai.google.dev/gemini-api/docs/speech-generation#voice-options
+# Full list: https://ai.google.dev/gemini-api/docs/speech-generation#voice-options
 TTS_VOICE=Kore   # calm female, good default for non-fiction
 TTS_SPEED=1.2
 ```
@@ -345,21 +368,9 @@ Popular Gemini TTS voices for audiobooks:
 | `Fenrir` | male, mid-range, neutral — versatile |
 | `Puck` | male, energetic — good for younger audiences / dialogue-heavy |
 
-You can list all available voices with:
+**Note on audio format:** Gemini TTS only returns PCM (raw 24kHz 16-bit mono). The script handles this automatically — it always requests PCM, then converts to your `TTS_FORMAT` (default `mp3`) locally with ffmpeg. Switching from OpenAI/Kokoro to Gemini requires **no config changes** beyond `TTS_MODEL` and `TTS_VOICE`.
 
-```bash
-curl -s "https://ai.google.dev/gemini-api/docs/speech-generation" | grep -oE '`[A-Z][a-z]+`' | sort -u
-```
-
-**Why this is worth trying if you came from Kokoro:**
-
-The `clean_for_tts()` pass still helps (especially the em-dash and parentheses normalization), but Google's TTS engine does most of the heavy lifting itself. If you were at ~4% weird pauses with Kokoro, expect <1% with Gemini TTS — and the `clean_for_tts` regexes become "nice to have" rather than "essential".
-
-**Note on audio format:** Gemini TTS only supports `response_format="pcm"` (raw 24kHz 16-bit mono PCM). The script handles this automatically — it always requests PCM, then converts to your `TTS_FORMAT` (default `mp3`) locally with ffmpeg. This means switching from OpenAI/Kokoro to Gemini requires **no config changes** beyond `TTS_MODEL` and `TTS_VOICE`.
-
-**Pricing (2026):** OpenRouter charges ~$1/M output characters for `gemini-3.1-flash-tts-preview`. A 3-hour book = ~$2-3, a 10-hour book = ~$7-10. Substantially cheaper than ElevenLabs, more expensive than Kokoro (which is $0). The quality/price tradeoff sits between OpenAI `gpt-4o-mini-tts` and ElevenLabs `eleven_turbo_v2_5`.
-
-**Want to use Google Cloud TTS directly (not via OpenRouter)?** That requires Google's native REST API (`/v1/text:synthesize`) with OAuth 2.0 or a Google Cloud API key, and isn't OpenAI-compatible. The script doesn't support it natively yet — PRs welcome. For most audiobook use cases, the OpenRouter route is simpler and gives the same underlying model.
+**Pricing:** OpenRouter charges per 1M characters of audio output. See <https://openrouter.ai/models?modality=text-to-speech> for current rates. Rough guide: a 3-hour book ≈ $2-5, a 10-hour book ≈ $7-15. Substantially cheaper than ElevenLabs, more expensive than Kokoro (which is ~$0.001 for a 3-hour book).
 
 **Option 5 — Local MLX TTS on Apple Silicon (free, $0/M, fast on M-series)**
 
@@ -432,11 +443,11 @@ python3 convert_books.py --dry-run
 
 **Why a separate venv and subprocess:** MLX is a heavy dependency (specific Python version, Metal runtime, model weights). Keeping it in an isolated venv via subprocess means your main `convert_books.py` stays light and works on any platform (Linux, Mac, Windows). On non-Apple-Silicon machines, the script gives a clear "use TTS_PROVIDER=openai_compatible instead" error.
 
-**Cost comparison for the Masalha book (~10 hours of audio):**
+**Cost comparison for a typical ~10-hour book:**
 
 | Provider | Time | Cost | Quality |
 |---|---|---|---|
-| Gemini via OpenRouter | ~25 min (parallel) | ~$12 | Excellent |
+| Gemini via OpenRouter | ~25 min (parallel) | ~$1-2 | Excellent |
 | ElevenLabs | ~85 min | ~$30-100 | Best |
 | **MLX local on M5** | **~12 min** | **$0** | **Very good** |
 
@@ -458,23 +469,26 @@ TTS_INSTRUCTIONS=
 
 ## Cost (rough)
 
-A 3-hour audiobook (≈ 180 000 chars) on `gpt-4o-mini-tts-2025-12-15`:
+Prices are per **1M characters of generated audio**. A 3-hour audiobook ≈ 180 000 chars, a 10-hour book ≈ 600 000 chars. These are ballpark figures; check each provider's pricing page for current rates — they change often.
 
-| Provider | 3-hour book | 10-hour book |
-|---|---|---|
-| **OpenRouter `kokoro-82m`** | **~$0.001** (effectively free) | **~$0.005** |
-| **OpenRouter `gpt-4o-mini-tts-2025-12-15`** | **~$1.50** | **~$5.00** |
-| **OpenRouter `google/gemini-3.1-flash-tts-preview`** | **~$0.20** | **~$0.60** |
-| OpenAI `gpt-4o-mini-tts` | ~$1.10 | ~$3.70 |
-| OpenAI `tts-1` | ~$2.70 | ~$9.00 |
-| OpenAI `tts-1-hd` | ~$5.40 | ~$18.00 |
-| ElevenLabs `turbo_v2_5` | ~$30 | ~$100 |
-| ElevenLabs `multilingual_v2` | ~$32 | ~$108 |
-| Self-hosted (Kokoro) | **$0** (your GPU) | **$0** |
-
-Token-based models bill audio output at ~$12/M tokens. `tts-1` and `tts-1-hd` bill per character ($15 and $30 per million).
+| Provider | 3-hour book | 10-hour book | Quality |
+|---|---|---|---|
+| **OpenRouter `kokoro-82m`** | **~$0.001** | **~$0.005** | Good (open-weight) |
+| **OpenRouter `gemini-2.5-flash-preview-tts`** | **~$0.05** | **~$0.20** | Excellent |
+| **OpenRouter `gemini-2.5-pro-preview-tts`** | **~$0.20** | **~$0.60** | Excellent |
+| **OpenRouter `gpt-4o-mini-tts-2025-12-15`** | **~$0.50** | **~$1.80** | Very good |
+| OpenAI `gpt-4o-mini-tts` | ~$1.10 | ~$3.70 | Very good |
+| OpenAI `tts-1` | ~$2.70 | ~$9.00 | Good |
+| OpenAI `tts-1-hd` | ~$5.40 | ~$18.00 | Very good |
+| ElevenLabs `turbo_v2_5` | ~$30 | ~$100 | Best |
+| ElevenLabs `multilingual_v2` | ~$32 | ~$108 | Best (most expensive) |
+| **MLX local on Apple Silicon** | **$0** (your Mac) | **$0** | Very good |
 
 **Sweet spot for non-fiction audiobooks:** Google Gemini TTS via OpenRouter. ~$0.20 for a 3-hour book, much better text normalization than Kokoro, no ElevenLabs-tier pricing.
+
+**Sweet spot for cost-is-no-object fiction:** ElevenLabs `turbo_v2_5`. Best long-form narration quality, but $30+ for a 3-hour book.
+
+**Sweet spot for free, fast personal library:** MLX local on M-series Mac. Zero per-book cost after initial setup, ~12-25 min for a 10-hour book depending on your chip.
 
 ---
 
