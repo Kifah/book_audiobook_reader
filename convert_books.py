@@ -563,6 +563,9 @@ def _pcm_chunks_to_mp3(pcm_files: list[Path], out_path: Path) -> None:
 
     Assumes all PCM files share the standard TTS-PCM signature:
     24kHz, 16-bit signed little-endian, mono. Same as _pcm_to_format.
+    
+    Inserts 200ms of silence between chunks to create smooth transitions
+    and prevent abrupt sentence breaks.
     """
     if not pcm_files:
         raise ValueError("_pcm_chunks_to_mp3 called with empty pcm_files list")
@@ -580,13 +583,23 @@ def _pcm_chunks_to_mp3(pcm_files: list[Path], out_path: Path) -> None:
     ]
     log.debug("    [pcm-chunks] ffmpeg cmd=%s, files=%d", ffmpeg_cmd, len(pcm_files))
 
-    # Read all PCM chunks into memory and pipe to ffmpeg in one shot.
+    # Create 200ms silence gap between chunks for smooth transitions.
+    # 24kHz, 16-bit mono: 24000 samples/sec × 0.2 sec × 2 bytes/sample = 9600 bytes
+    silence_gap = b"\x00" * 9600  # 200ms of silence at 24kHz 16-bit mono
+
+    # Read all PCM chunks into memory with silence gaps between them.
     # For a 30-min chapter at 24kHz 16-bit mono, the combined PCM is
     # ~86MB — fits comfortably in RAM and avoids the complexity of
     # streaming via communicate(input=generator). communicate() doesn't
     # actually support generators in all Python versions; loading is
     # simpler and the encoding step is the bottleneck anyway.
-    combined = b"".join(p.read_bytes() for p in pcm_files)
+    parts = []
+    for i, p in enumerate(pcm_files):
+        parts.append(p.read_bytes())
+        # Add silence gap between chunks (but not after the last chunk)
+        if i < len(pcm_files) - 1:
+            parts.append(silence_gap)
+    combined = b"".join(parts)
 
     proc = subprocess.Popen(
         ffmpeg_cmd,
@@ -919,7 +932,7 @@ def concat_mp3_parts(
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-f", "concat", "-safe", "0",
                 "-i", str(list_path.resolve()),
-                "-c:a", "pcm_s16le", "-ar", "44100", "-ac", str(TTS_CHANNELS),
+                "-c:a", "pcm_s16le", "-ar", "24000", "-ac", str(TTS_CHANNELS),
                 str(wav_path),
             ],
             cwd=os.getcwd(), capture_output=True, text=True,
