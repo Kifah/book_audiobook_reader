@@ -55,6 +55,24 @@ DRY_RUN_SECONDS = 30.0  # approximate; we budget by chars not actual time
 # Continue flag (set by --continue CLI flag; when True, skip chapters that already
 # have an MP3 in audiobooks/<book>/chapters/, so an aborted run can be resumed)
 CONTINUE_RUN = False
+# Skip-front-matter flag (set by --skip-front-matter CLI flag; default True)
+SKIP_FRONT_MATTER = True
+# Clean-for-tts flag (set by --clean / --no-clean CLI flag; default True)
+CLEAN_FOR_TTS = True
+
+# Chapter title patterns to skip when SKIP_FRONT_MATTER is on. Case-insensitive
+# substring match. The defaults cover the structural front-matter and back-matter
+# that most academic/non-fiction books have:
+#   front: cover, halftitle, title, copyright, contents (TOC)
+#   back:  bibliography, index, nav (EPUB navigation doc)
+# Keep: acknowledgements (often personal), introduction (author's framing),
+#       notes (author's commentary), all real chapter files.
+# Override with SKIP_FRONT_MATTER_PATTERNS env var (comma-separated, e.g.
+# "cover,copyright,bibliography" to skip only those).
+DEFAULT_SKIP_PATTERNS = [
+    "cover", "halftitle", "title page", "title", "copyright",
+    "contents", "table of contents", "bibliography", "index", "nav",
+]
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "openai_compatible").strip().lower()
 TTS_API_URL = os.getenv("TTS_API_URL", "https://openrouter.ai/api/v1/audio/speech")
@@ -83,6 +101,13 @@ INPUT_DIR = Path(os.getenv("INPUT_DIR", "epubs"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "audiobooks"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# Comma-separated list of chapter-title patterns to skip. If the env var is
+# set, it OVERRIDES the DEFAULT_SKIP_PATTERNS entirely. If empty/unset, the
+# defaults are used (when SKIP_FRONT_MATTER is on).
+SKIP_FRONT_MATTER_PATTERNS = [
+    p.strip().lower() for p in os.getenv("SKIP_FRONT_MATTER_PATTERNS", "").split(",") if p.strip()
+] or list(DEFAULT_SKIP_PATTERNS)
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -100,9 +125,16 @@ log = logging.getLogger("convert_books")
 
 def slugify(text: str) -> str:
     """Filesystem-safe ASCII slug from arbitrary text."""
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
     return text or "book"
+
+
+def is_front_matter(title: str, patterns: list[str]) -> bool:
+    """Return True if a chapter title matches any skip pattern (case-insensitive
+    substring match). Used by --skip-front-matter to drop structural pages like
+    cover/copyright/TOC/bibliography from the rendered audiobook."""
+    t = title.lower().strip()
+    return any(p in t for p in patterns)
 
 
 def ffmpeg_available() -> bool:
@@ -208,10 +240,81 @@ def extract_chapters(epub_path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Text cleanup for TTS
+# ---------------------------------------------------------------------------
+
+# These characters cause audible pauses/breaths in TTS engines (especially
+# Kokoro, but also OpenAI and ElevenLabs). The clean_for_tts() function
+# normalizes the text so short common words like "of" and "the" don't get
+# stuck next to awkward punctuation, and runs of whitespace don't get
+# interpreted as sentence breaks.
+_MULTI_SPACE = re.compile(r"[ \t]{2,}")
+_SMALL_WORDS = (
+    r"(?:a|an|the|of|in|on|at|to|for|by|with|and|or|but|is|was|are|were|"
+    r"be|been|has|have|had|it|its|he|she|his|her|they|them|their|"
+    r"this|that|these|those|as|if|so|not|no|do|does|did|"
+    r"I|you|we|us|our|my|me)"
+)
+_SMALL_WORD_PUNCT = re.compile(
+    rf"(\b{_SMALL_WORDS})\s+([.,;:!?])",
+    re.IGNORECASE,
+)
+_ELLIPSIS = re.compile(r"\u2026|\.{2,}")
+# Numeric ranges like "1750–1550" or "61–73" — keep semantic meaning, but
+# Kokoro/most TTS engines pause audibly on en-dashes, so say "to" instead.
+_EN_DASH_NUMERIC = re.compile(r"(\d[\d,]*)\s*[\u2013\u2014]\s*(\d[\d,]*)")
+# Word en-dashes — clause-level breaks. Replace with ", " (a mild pause).
+# Catches patterns like "Palestine–Egypt" or "ancient\u2013modern" but not
+# numeric ranges (handled above) or hyphenated words (which use a regular
+# hyphen-minus, not en/em-dash).
+
+
+def clean_for_tts(text: str) -> str:
+    """Normalize text for TTS to avoid audible pauses on common short words.
+
+    Kokoro (and most TTS engines) add ~100-300ms of silence when they see:
+      - Em-dashes (\u2014) and en-dashes (\u2013)
+      - Ellipses (\u2026 or "...")
+      - Double spaces (engine reads as sentence break)
+      - Common short words like "of", "the", "and" followed by punctuation
+        (engine over-emphasizes the breath, creating a noticeable gap)
+
+    This function:
+      1. Replaces em/en-dashes with comma-space (or " and " for paired dashes)
+      2. Replaces ellipses with a period (so we get a real sentence break)
+      3. Collapses multiple spaces to one
+      4. Removes the space between a short word and the following punctuation
+         (e.g. "of ." -> "of." — but we keep the period so the TTS still pauses)
+    """
+    # 1. Ellipses -> period (real sentence break, not the dramatic "..." pause).
+    #    Run the substitution on the literal ellipsis chars first, then collapse
+    #    any run of 2+ remaining dots. Also collapse "spaced ellipses" like
+    #    ". . ." which many typists use.
+    text = text.replace("\u2026", ".")
+    text = re.sub(r"(\.)(\s\.)+", ".", text)  # ". . ." -> "."
+    text = _ELLIPSIS.sub(".", text)
+    # 2. Numeric ranges: "1750\u20131550" -> "1750 to 1550". Kokoro pauses on
+    #    the en-dash, which makes page numbers and year ranges sound stilted.
+    #    Must run BEFORE the generic dash replacement below.
+    text = _EN_DASH_NUMERIC.sub(r"\1 to \2", text)
+    # 3. Em-dash / en-dash -> ", " (mild pause, no breath). This catches the
+    #    remaining word-level dashes like "Palestine\u2013Egypt".
+    text = text.replace("\u2014", ", ").replace("\u2013", ", ")
+    # 4. Collapse runs of whitespace (incl. tabs)
+    text = _MULTI_SPACE.sub(" ", text)
+    # 5. Remove the space between a short word and the punctuation that follows.
+    #    The regex matches `<word> <punct>` and we just drop the space.
+    text = _SMALL_WORD_PUNCT.sub(r"\1\2", text)
+    # 6. Final whitespace tidy (collapse newlines we may have created)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
 # Text chunking (sentence-aware, character-bounded)
 # ---------------------------------------------------------------------------
 
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'(\[])")
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'(\[)])")
 
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
@@ -385,6 +488,13 @@ def render_chapter(title: str, text: str, out_path: Path, tmp_dir: Path) -> None
     Render a single chapter to one MP3 file. Chunks the text, calls TTS,
     concatenates with ffmpeg (no re-encode if possible).
     """
+    # Clean text for TTS: collapse em-dashes, ellipses, double spaces, and
+    # remove space between small words (of/the/and) and following punctuation.
+    # Numeric ranges like "1750–1550" become "1750 to 1550" so the TTS engine
+    # doesn't add an audible breath on the en-dash. This eliminates the
+    # ~100-300ms pauses that Kokoro and other engines add on these patterns.
+    if CLEAN_FOR_TTS:
+        text = clean_for_tts(text)
     chunks = chunk_text(text, TTS_CHUNK_CHARS)
     log.info("  Chapter '%s' → %d chunk(s)", title, len(chunks))
 
@@ -468,6 +578,23 @@ def convert_book(epub_path: Path) -> Path:
     chapters = parsed["chapters"]
     if not chapters:
         raise RuntimeError(f"No chapters extracted from {epub_path}")
+
+    # --skip-front-matter: drop structural front/back-matter (cover, copyright,
+    # TOC, bibliography, index, nav, etc.) by default. See SKIP_FRONT_MATTER_PATTERNS.
+    if SKIP_FRONT_MATTER:
+        before = len(chapters)
+        chapters = [c for c in chapters if not is_front_matter(c["title"], SKIP_FRONT_MATTER_PATTERNS)]
+        skipped = before - len(chapters)
+        if skipped:
+            log.info(
+                "Skipped %d front/back-matter chapter(s) matching patterns %s",
+                skipped, SKIP_FRONT_MATTER_PATTERNS,
+            )
+        if not chapters:
+            raise RuntimeError(
+                f"All {before} chapters matched front-matter patterns — nothing to render. "
+                f"Use --no-skip-front-matter or set SKIP_FRONT_MATTER_PATTERNS to override."
+            )
 
     book_slug = slugify(book_title)
     if DRY_RUN:
@@ -672,6 +799,29 @@ def _parse_args(argv: list[str] | None = None) -> dict:
              "Also skips re-rendering the full-book MP3 if it already exists. "
              "If you've changed the EPUB since the abort, do a fresh run instead.",
     )
+    p.add_argument(
+        "--skip-front-matter", dest="skip_front_matter", action="store_true", default=True,
+        help="Skip structural front/back-matter chapters (cover, copyright, TOC, "
+             "bibliography, index, nav) by default. Pass --no-skip-front-matter to "
+             "render everything. Customize the patterns with the SKIP_FRONT_MATTER_PATTERNS "
+             "env var (comma-separated).",
+    )
+    p.add_argument(
+        "--no-skip-front-matter", dest="skip_front_matter", action="store_false",
+        help="Render every chapter including cover, copyright, TOC, etc.",
+    )
+    p.add_argument(
+        "--clean", dest="clean", action="store_true", default=True,
+        help="Normalize text before TTS to eliminate audible pauses (default). "
+             "Replaces em/en-dashes with commas, ellipses with periods, collapses "
+             "double spaces, and converts numeric ranges like '1750–1550' to "
+             "'1750 to 1550'.",
+    )
+    p.add_argument(
+        "--no-clean", dest="clean", action="store_false",
+        help="Send raw EPUB text straight to TTS. Use this if the cleanup changes "
+             "the meaning or you want maximum control over the input.",
+    )
     args = p.parse_args(argv)
     return {
         "dry_run": args.dry_run,
@@ -679,17 +829,21 @@ def _parse_args(argv: list[str] | None = None) -> dict:
         "book": Path(args.book) if args.book else None,
         "list_books": args.list_books,
         "continue_run": args.continue_run,
+        "skip_front_matter": args.skip_front_matter,
+        "clean": args.clean,
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    # Make dry-run / continue flags module-global so convert_book can see them
-    global DRY_RUN, DRY_RUN_SECONDS, CONTINUE_RUN
+    # Make dry-run / continue / skip-front-matter / clean flags module-global so convert_book can see them
+    global DRY_RUN, DRY_RUN_SECONDS, CONTINUE_RUN, SKIP_FRONT_MATTER, CLEAN_FOR_TTS
     DRY_RUN = args["dry_run"]
     DRY_RUN_SECONDS = args["dry_run_seconds"]
     CONTINUE_RUN = args["continue_run"]
+    SKIP_FRONT_MATTER = args["skip_front_matter"]
+    CLEAN_FOR_TTS = args["clean"]
 
     if not INPUT_DIR.exists():
         INPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -738,6 +892,10 @@ def main(argv: list[str] | None = None) -> int:
             log.error("--continue and --dry-run are incompatible. Pick one.")
             return 1
         log.info("CONTINUE mode — will skip chapters that already have an MP3 in chapters/.")
+    if not SKIP_FRONT_MATTER:
+        log.info("Front-matter filtering disabled — will render cover, copyright, TOC, etc.")
+    if not CLEAN_FOR_TTS:
+        log.info("Text cleanup disabled — sending raw EPUB text straight to TTS.")
 
     t0 = time.time()
     successes, failures = 0, 0
