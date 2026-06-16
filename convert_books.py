@@ -283,9 +283,40 @@ _ELLIPSIS = re.compile(r"\u2026|\.{2,}")
 # Kokoro/most TTS engines pause audibly on en-dashes, so say "to" instead.
 _EN_DASH_NUMERIC = re.compile(r"(\d[\d,]*)\s*[\u2013\u2014]\s*(\d[\d,]*)")
 # Word en-dashes — clause-level breaks. Replace with ", " (a mild pause).
-# Catches patterns like "Palestine–Egypt" or "ancient\u2013modern" but not
+# Catches patterns like "Palestine–Egypt" or "ancient–modern" but not
 # numeric ranges (handled above) or hyphenated words (which use a regular
 # hyphen-minus, not en/em-dash).
+# Parentheses with content: "(text)" -> ", text, "
+# Engine adds ~200ms breath on each paren. Wrap in commas for smooth clause.
+_PARENS_WITH_CONTENT = re.compile(r"\s*\(([^()]+?)\)\s*")
+# Smart double quotes around phrases: "word" / "phrase" -> word / phrase
+# (curly quotes: \u201c \u201d)
+_QUOTED_DQUOTE_SMART = re.compile(r"\u201c([^\u201d\n]{1,200}?)\u201d")
+# Smart single quotes around words: 'word' -> word
+# (curly quotes: \u2018 \u2019). Negative lookahead avoids contractions.
+_QUOTED_SQUOTE_SMART = re.compile(
+    r"\u2018(\w[\w\s]{0,50}?\w)\u2019"
+)
+# Straight double quotes: "word" -> word
+# Be conservative — only strip if content is short (<200 chars) to avoid
+# eating dialogue across multiple paragraphs.
+_QUOTED_DQUOTE_STRAIGHT = re.compile(r'"([^"\n]{1,200}?)"')
+# Straight single quotes around a single word: 'word' -> word
+# (must be a real word inside, not a contraction like it's or don't)
+_QUOTED_SQUOTE_STRAIGHT = re.compile(r"'(\w[\w\s]{0,50}?\w)'")
+# Spaced contractions: "it 's" / "we 're" / "don ' t" -> "it's" / "we're" / "don't"
+# The single-quote and trailing letter have at most one space between them.
+_SPACED_CONTRACTION = re.compile(r"\b(\w+)\s+'\s*(\w+)\b")
+# Decade abbreviation: '80s / '90s -> 80s / 90s (don't read the quote)
+_DECADE_ABBR = re.compile(r"'(\d{2}s)\b")
+# Spaced hyphen: "word - word" -> "word, word" (clause break)
+_SPACED_HYPHEN = re.compile(r"(\w)\s+-\s+(\w)")
+# Adverb-adverb compound: "socially-culturally" -> "socially and culturally"
+# Both halves ending in -ly is a strong signal that the hyphen separates
+# two adverbs (not a compound word like "well-known" or "ice-cream").
+# Catches: socially-culturally, politically-economically, physically-mentally
+# Doesn't touch: well-known, long-term, ice-cream, mother-in-law
+_LY_HYPHEN = re.compile(r"(\w+ly)-(\w+ly)\b")
 
 
 def clean_for_tts(text: str) -> str:
@@ -297,13 +328,20 @@ def clean_for_tts(text: str) -> str:
       - Double spaces (engine reads as sentence break)
       - Common short words like "of", "the", "and" followed by punctuation
         (engine over-emphasizes the breath, creating a noticeable gap)
+      - Parentheses (engine adds breath on both sides)
+      - Quote marks around phrases (engine reads them as "open-quote ... close-quote")
+      - Spaced contractions like "it 's" (engine stumbles on the spaces)
 
     This function:
-      1. Replaces em/en-dashes with comma-space (or " and " for paired dashes)
-      2. Replaces ellipses with a period (so we get a real sentence break)
-      3. Collapses multiple spaces to one
+      1. Replaces ellipses with a period (real sentence break)
+      2. Replaces em/en-dashes with comma-space
+      3. Collapses multiple spaces
       4. Removes the space between a short word and the following punctuation
-         (e.g. "of ." -> "of." — but we keep the period so the TTS still pauses)
+      5. Wraps parentheses content in ", " (engine reads smoothly as a clause)
+      6. Strips quote marks around words and short phrases
+      7. Fixes spaced contractions ("it 's" -> "it's")
+      8. Strips decade abbreviations ('80s -> 80s)
+      9. Replaces spaced hyphens ("word - word") with comma-space
     """
     # 1. Ellipses -> period (real sentence break, not the dramatic "..." pause).
     #    Run the substitution on the literal ellipsis chars first, then collapse
@@ -324,7 +362,32 @@ def clean_for_tts(text: str) -> str:
     # 5. Remove the space between a short word and the punctuation that follows.
     #    The regex matches `<word> <punct>` and we just drop the space.
     text = _SMALL_WORD_PUNCT.sub(r"\1\2", text)
-    # 6. Final whitespace tidy (collapse newlines we may have created)
+    # 6. Parentheses: wrap content in ", " so TTS reads as a parenthetical
+    #    clause with a brief pause on each side, instead of a full breath.
+    #    "(see chapter 3)" -> ", see chapter 3, "
+    text = _PARENS_WITH_CONTENT.sub(r", \1, ", text)
+    # 7. Smart + straight double quotes around phrases: drop them entirely.
+    #    TTS engines read "quoted" as "open-quote quoted close-quote" with
+    #    audible breaths at the quote marks.
+    text = _QUOTED_DQUOTE_SMART.sub(r"\1", text)
+    text = _QUOTED_SQUOTE_SMART.sub(r"\1", text)
+    text = _QUOTED_DQUOTE_STRAIGHT.sub(r"\1", text)
+    # 8. Smart + straight single quotes around single words: drop them.
+    #    Catches 'word' but not apostrophes in contractions (it's, don't).
+    text = _QUOTED_SQUOTE_STRAIGHT.sub(r"\1", text)
+    # 9. Spaced contractions: "it 's" -> "it's", "we 're" -> "we 're" already
+    #    handled by the word-group above. This catches the rarer "don ' t" form.
+    text = _SPACED_CONTRACTION.sub(r"\1'\2", text)
+    # 10. Decade abbreviations: "'80s" -> "80s" (no quote read).
+    text = _DECADE_ABBR.sub(r"\1", text)
+    # 11. Spaced hyphens: "word - word" -> "word, word" (clause break).
+    text = _SPACED_HYPHEN.sub(r"\1, \2", text)
+    # 11b. Adverb-adverb compounds: "socially-culturally" -> "socially and culturally"
+    #     Run before _SPACED_HYPHEN to avoid double-processing. The -ly
+    #     heuristic is safe: compounds like "well-known" don't match because
+    #     "well" doesn't end in -ly.
+    text = _LY_HYPHEN.sub(r"\1 and \2", text)
+    # 12. Final whitespace tidy (collapse newlines we may have created)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
