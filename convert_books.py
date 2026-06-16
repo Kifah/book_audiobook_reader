@@ -448,7 +448,12 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
 def _tts_openai_compatible(text: str) -> bytes:
     """
     POST a single text chunk to an OpenAI-compatible /audio/speech endpoint.
-    Returns raw audio bytes (mp3 by default).
+    Returns raw audio bytes (mp3 by default, or TTS_FORMAT).
+
+    Some providers (notably Google Gemini TTS) only support `pcm` as a
+    response format, so we always request PCM, then convert to TTS_FORMAT
+    locally with ffmpeg. This is uniform across providers and means we
+    never get a 400 back from "unsupported response_format".
     """
     if not TTS_API_KEY:
         raise RuntimeError("TTS_API_KEY is not set. Copy .env.example to .env and add your key.")
@@ -457,7 +462,7 @@ def _tts_openai_compatible(text: str) -> bytes:
         "model": TTS_MODEL,
         "input": text,
         "voice": TTS_VOICE,
-        "response_format": TTS_FORMAT,
+        "response_format": "pcm",  # all major TTS providers support this
         "speed": TTS_SPEED,
     }
     # Some providers accept 'instructions' for steerable prosody (gpt-4o-mini-tts)
@@ -471,12 +476,71 @@ def _tts_openai_compatible(text: str) -> bytes:
         headers={
             "Authorization": f"Bearer {TTS_API_KEY}",
             "Content-Type": "application/json",
-            "Accept": "audio/mpeg",
+            # Some providers (Gemini) are strict about the Accept header for PCM
+            "Accept": "audio/L16;codec=pcm;rate=24000, audio/pcm, audio/*",
         },
         method="POST",
     )
     with request.urlopen(req, timeout=TTS_REQUEST_TIMEOUT) as resp:
-        return resp.read()
+        pcm_bytes = resp.read()
+
+    # If the API returned PCM, convert to TTS_FORMAT locally with ffmpeg.
+    # If it returned MP3/etc. directly (which happens with OpenAI and some
+    # other providers), ffmpeg can still convert it cleanly.
+    if TTS_FORMAT == "pcm":
+        return pcm_bytes
+
+    return _pcm_to_format(pcm_bytes, TTS_FORMAT)
+
+
+def _pcm_to_format(pcm_bytes: bytes, out_format: str) -> bytes:
+    """Convert raw PCM bytes (24kHz, 16-bit, mono) to the given audio format.
+
+    Uses ffmpeg as a subprocess because we don't want to add numpy/scipy as
+    a dependency for what is essentially one format conversion.
+
+    The PCM signature (24kHz, 16-bit, mono) is the OpenAI/Gemini/most
+    modern TTS API standard. If a provider returns different PCM parameters
+    we'd need to detect them via a probe — for now, hardcode the standard.
+    """
+    if not ffmpeg_available():
+        raise RuntimeError(
+            f"ffmpeg is required to convert PCM to {out_format} but was not found in PATH"
+        )
+    # Map TTS_FORMAT to ffmpeg codec. Most are obvious, but document the choice.
+    codec_map = {
+        "mp3":  ["-c:a", "libmp3lame", "-b:a", TTS_BITRATE],
+        "opus": ["-c:a", "libopus", "-b:a", "64k"],
+        "aac":  ["-c:a", "aac", "-b:a", "64k"],
+        "flac": ["-c:a", "flac"],
+        "wav":  ["-c:a", "pcm_s16le"],
+    }
+    codec_args = codec_map.get(out_format)
+    if codec_args is None:
+        raise ValueError(
+            f"Unsupported TTS_FORMAT={out_format!r}. Supported: {sorted(codec_map)}"
+        )
+
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "s16le", "-ar", "24000", "-ac", "1",  # input: PCM 24kHz mono 16-bit
+            "-i", "pipe:0",
+            *codec_args,
+            "-f", out_format, "pipe:1",
+        ],
+        input=pcm_bytes,
+        capture_output=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg PCM->{out_format} failed (exit {proc.returncode}): "
+            f"{proc.stderr.decode(errors='ignore')[:300]}"
+        )
+    if not proc.stdout:
+        raise RuntimeError(f"ffmpeg PCM->{out_format} returned no audio bytes")
+    return proc.stdout
 
 
 def _tts_elevenlabs(text: str) -> bytes:

@@ -355,6 +355,8 @@ curl -s "https://ai.google.dev/gemini-api/docs/speech-generation" | grep -oE '`[
 
 The `clean_for_tts()` pass still helps (especially the em-dash and parentheses normalization), but Google's TTS engine does most of the heavy lifting itself. If you were at ~4% weird pauses with Kokoro, expect <1% with Gemini TTS — and the `clean_for_tts` regexes become "nice to have" rather than "essential".
 
+**Note on audio format:** Gemini TTS only supports `response_format="pcm"` (raw 24kHz 16-bit mono PCM). The script handles this automatically — it always requests PCM, then converts to your `TTS_FORMAT` (default `mp3`) locally with ffmpeg. This means switching from OpenAI/Kokoro to Gemini requires **no config changes** beyond `TTS_MODEL` and `TTS_VOICE`.
+
 **Pricing (2026):** OpenRouter charges ~$1/M output characters for `gemini-3.1-flash-tts-preview`. A 3-hour book = ~$2-3, a 10-hour book = ~$7-10. Substantially cheaper than ElevenLabs, more expensive than Kokoro (which is $0). The quality/price tradeoff sits between OpenAI `gpt-4o-mini-tts` and ElevenLabs `eleven_turbo_v2_5`.
 
 **Want to use Google Cloud TTS directly (not via OpenRouter)?** That requires Google's native REST API (`/v1/text:synthesize`) with OAuth 2.0 or a Google Cloud API key, and isn't OpenAI-compatible. The script doesn't support it natively yet — PRs welcome. For most audiobook use cases, the OpenRouter route is simpler and gives the same underlying model.
