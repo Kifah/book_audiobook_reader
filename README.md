@@ -361,6 +361,87 @@ The `clean_for_tts()` pass still helps (especially the em-dash and parentheses n
 
 **Want to use Google Cloud TTS directly (not via OpenRouter)?** That requires Google's native REST API (`/v1/text:synthesize`) with OAuth 2.0 or a Google Cloud API key, and isn't OpenAI-compatible. The script doesn't support it natively yet — PRs welcome. For most audiobook use cases, the OpenRouter route is simpler and gives the same underlying model.
 
+**Option 5 — Local MLX TTS on Apple Silicon (free, $0/M, fast on M-series)**
+
+Apple's [MLX framework](https://github.com/ml-explore/mlx) runs TTS models on the M-series GPU/ANE. With the M5, this is now competitive with cloud TTS in both speed and quality — and it's free, with no rate limits.
+
+**Hardware requirements (this is NOT optional):**
+- Apple Silicon Mac (M1 / M2 / M3 / M4 / M5)
+- Intel Macs and Linux/Windows are **not supported** by MLX
+- macOS 13.5+ recommended
+- 8 GB RAM minimum (16 GB+ for the larger models)
+- First run downloads the model weights (~500MB – 2GB depending on choice)
+
+**Performance depends on your chip. Realistic numbers per 12-chunk chapter:**
+
+| Mac | Approx time per chapter | Notes |
+|---|---|---|
+| M5 base | ~3-4s | Real-time on GPU/ANE |
+| M5 Pro / Max / Ultra | ~2-3s | More GPU cores |
+| M4 / M3 | ~5-6s | Real-time capable |
+| M2 / M1 | ~8-10s | Real-time capable |
+| Older Apple Silicon | ~10-15s | Real-time factor 1-2x |
+
+These are rough — actual speed varies with model size, chunk length, and what else your Mac is doing. The same script works on all Apple Silicon, just slower on older chips.
+
+**Setup (one-time, ~5 minutes):**
+
+```bash
+# 1. Create an isolated venv (keep MLX out of your main project venv)
+python3 -m venv ~/.venvs/mlx-audio
+source ~/.venvs/mlx-audio/bin/activate
+
+# 2. Install mlx-audio
+pip install mlx-audio
+
+# 3. Find the venv Python path (you'll need it for .env)
+which python
+# Example output: /Users/you/.venvs/mlx-audio/bin/python
+deactivate
+```
+
+**.env configuration:**
+
+```bash
+# .env — Local MLX TTS on Apple Silicon
+TTS_PROVIDER=mlx_local
+TTS_FORMAT=mp3
+
+# Path to the MLX venv Python you just created
+MLX_PYTHON=/Users/YOU/.venvs/mlx-audio/bin/python
+
+# Model: pick one. Bigger = better quality, slower.
+MLX_MODEL=mlx-community/orpheus-tts-0.1-finetune-bf16   # best quality, ~2GB
+# MLX_MODEL=mlx-community/outetts-0.3-500M-bf16        # smaller, faster, ~1GB
+# MLX_MODEL=mlx-community/Kokoro-82M-bf16              # 54 voices, 8 languages, ~500MB
+
+# Voice: model-specific. See HuggingFace model page for valid voices.
+MLX_VOICE=tara
+TTS_SPEED=1.2
+```
+
+**Why Orpheus-1B:** best quality-to-size ratio of the MLX community models. Near-ElevenLabs quality for narration, runs at ~1.5x real-time on M5. The other two are smaller alternatives if you want faster or have RAM constraints.
+
+**Try it:**
+
+```bash
+# First run: downloads the model (~10-30s) then does inference
+python3 convert_books.py --dry-run
+# Subsequent runs: just inference, ~3-4s per chapter on M5
+```
+
+**Why a separate venv and subprocess:** MLX is a heavy dependency (specific Python version, Metal runtime, model weights). Keeping it in an isolated venv via subprocess means your main `convert_books.py` stays light and works on any platform (Linux, Mac, Windows). On non-Apple-Silicon machines, the script gives a clear "use TTS_PROVIDER=openai_compatible instead" error.
+
+**Cost comparison for the Masalha book (~10 hours of audio):**
+
+| Provider | Time | Cost | Quality |
+|---|---|---|---|
+| Gemini via OpenRouter | ~25 min (parallel) | ~$12 | Excellent |
+| ElevenLabs | ~85 min | ~$30-100 | Best |
+| **MLX local on M5** | **~12 min** | **$0** | **Very good** |
+
+**The M5 makes local TTS the obvious choice** for personal audiobooks: free, fast, no rate limits, no API keys. Cloud is still better for one-off professional work where every word matters, but for converting your own library, local is the winner.
+
 ### Using a self-hosted model
 
 Any OpenAI-compatible audio endpoint will work. Example for [Kokoro-82M](https://github.com/remsky/Kokoro-82M) via a LocalAI-style proxy:

@@ -646,10 +646,129 @@ def _tts_elevenlabs(text: str) -> bytes:
         return resp.read()
 
 
+# Path to the MLX standalone script (relative to this file). Only used
+# when TTS_PROVIDER == "mlx_local". The script lives next to convert_books.py
+# and can be invoked from any Python venv that has mlx-audio installed.
+MLX_STANDALONE_SCRIPT = Path(__file__).parent / "tts_mlx_standalone.py"
+
+
+def _tts_mlx_local(text: str) -> bytes:
+    """TTS via local MLX inference on Apple Silicon (M1/M2/M3/M4/M5).
+
+    Invokes tts_mlx_standalone.py as a subprocess. This keeps the heavy
+    MLX dependency isolated in its own venv, so the main convert_books.py
+    stays light and works on any machine (Linux, Mac, Windows).
+
+    Returns raw PCM bytes (24kHz, 16-bit signed little-endian, mono) —
+    same format as openai_compatible with Gemini, so the existing
+    chapter-concat pipeline handles it without changes.
+
+    ⚠️  Hardware requirements (this is NOT optional):
+        - Apple Silicon Mac (M1/M2/M3/M4/M5). Intel Macs and Linux/Windows
+          are NOT supported by MLX. On those platforms, use
+          TTS_PROVIDER=openai_compatible instead.
+        - macOS 13.5+ recommended
+        - 8 GB RAM minimum (16 GB+ for the larger models)
+        - First run downloads the model weights (500MB-2GB depending on
+          which MLX_MODEL you choose)
+
+    ⏱️  Speed varies a lot with hardware (per 12-chunk chapter):
+        - M5 base:           ~3-4s  (real-time on GPU/ANE)
+        - M5 Pro/Max/Ultra:  ~2-3s
+        - M4 / M3:           ~5-6s
+        - M2 / M1:           ~8-10s
+        - Older Apple Silicon: still works, but real-time factor ~1-2x
+        The same script will work on all Apple Silicon, just slower on
+        older chips. The M5 is fast enough that this is now competitive
+        with cloud TTS (and free, with no rate limits).
+
+    Required setup (one-time, on Apple Silicon Mac):
+        python3 -m venv ~/.venvs/mlx-audio
+        source ~/.venvs/mlx-audio/bin/activate
+        pip install mlx-audio
+        # First run downloads the model (~500MB-2GB depending on choice)
+
+    Configuration (in .env):
+        TTS_PROVIDER=mlx_local
+        MLX_MODEL=mlx-community/orpheus-tts-0.1-finetune-bf16
+        # or: mlx-community/outetts-0.3-500M-bf16 (smaller, faster)
+        # or: mlx-community/Kokoro-82M-bf16 (same as before, just MLX-accelerated)
+        MLX_VOICE=tara   # model-specific voice name
+        MLX_PYTHON=~/.venvs/mlx-audio/bin/python  # path to MLX venv Python
+    """
+    if not MLX_STANDALONE_SCRIPT.exists():
+        raise RuntimeError(
+            f"MLX standalone script not found at {MLX_STANDALONE_SCRIPT}. "
+            f"This file ships with book_audiobook_reader — please reinstall."
+        )
+
+    # Resolve the Python interpreter to use. MLX requires Python 3.9-3.12
+    # and a specific venv; using system Python would fail.
+    mlx_python = os.getenv("MLX_PYTHON", "")
+    if not mlx_python:
+        # Try common locations before erroring
+        for candidate in [
+            os.path.expanduser("~/.venvs/mlx-audio/bin/python"),
+            os.path.expanduser("~/venvs/mlx-audio/bin/python"),
+            "/opt/homebrew/bin/python3",
+        ]:
+            if os.path.exists(candidate):
+                mlx_python = candidate
+                break
+    if not mlx_python or not os.path.exists(mlx_python):
+        raise RuntimeError(
+            "MLX_PYTHON not set and no default MLX venv found. "
+            "Set MLX_PYTHON=/path/to/your/mlx-venv/bin/python in .env, "
+            "or run: python3 -m venv ~/.venvs/mlx-audio && "
+            "source ~/.venvs/mlx-audio/bin/activate && pip install mlx-audio"
+        )
+
+    model = os.getenv("MLX_MODEL", "mlx-community/orpheus-tts-0.1-finetune-bf16")
+    voice = os.getenv("MLX_VOICE", "tara")
+    speed = float(os.getenv("TTS_SPEED", "1.0"))
+
+    proc = subprocess.run(
+        [
+            mlx_python,
+            str(MLX_STANDALONE_SCRIPT),
+            "--text", text,
+            "--model", model,
+            "--voice", voice,
+            "--speed", str(speed),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"MLX TTS failed (exit {proc.returncode}): "
+            f"{proc.stderr.strip()[:500]}"
+        )
+    # The standalone script writes PCM bytes to a temp file and prints the
+    # path on stdout. This keeps the JSON-control-plane separate from
+    # the binary audio data, avoiding shell-escaping issues with non-UTF8 bytes.
+    pcm_path = Path(proc.stdout.strip())
+    if not pcm_path.exists():
+        raise RuntimeError(
+            f"MLX TTS reported success but output file {pcm_path} not found. "
+            f"stderr was: {proc.stderr.strip()[:500]}"
+        )
+    try:
+        return pcm_path.read_bytes()
+    finally:
+        # Always clean up the temp file
+        try:
+            pcm_path.unlink()
+        except OSError:
+            pass
+
+
 # Provider dispatch table — add new providers here.
 _TTS_PROVIDERS = {
     "openai_compatible": _tts_openai_compatible,
     "elevenlabs": _tts_elevenlabs,
+    "mlx_local": _tts_mlx_local,
 }
 
 
