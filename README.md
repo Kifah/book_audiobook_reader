@@ -1,9 +1,9 @@
 # 📚 book_audiobook_reader
 
-> Turn a folder of `.epub` files into zipped MP3 audiobooks via any OpenAI-compatible TTS endpoint (OpenRouter, OpenAI, or self-hosted).
+> Turn a folder of `.epub` files into MP3 audiobooks via any OpenAI-compatible TTS endpoint (OpenRouter, OpenAI, or self-hosted).
 
 ```
-epubs/  ──►  convert_books.py  ──►  audiobooks/<book>.zip
+epubs/  ──►  convert_books.py  ──►  audiobooks/<book>/
 ```
 
 ---
@@ -12,16 +12,15 @@ epubs/  ──►  convert_books.py  ──►  audiobooks/<book>.zip
 
 1. **Reads** every `.epub` you drop in `epubs/`
 2. **Extracts** chapters in reading order, stripping HTML
-3. **Chunks** each chapter into ~4 000-character pieces (sentence-aware, never mid-sentence)
+3. **Chunks** each chapter into ~2 500-character pieces (sentence-aware, never mid-sentence)
 4. **Calls** your TTS endpoint for each chunk — in parallel by default (4 workers), so a 10-hour book finishes in ~25 min instead of ~85
 5. **Concatenates** the resulting MP3s with `ffmpeg` (no re-encoding, no quality loss)
-6. **Zips** the per-chapter MP3s + a single full-book MP3 into `audiobooks/<book-slug>.zip`
+6. **Writes** the per-chapter MP3s + a single full-book MP3 into `audiobooks/<book-slug>/`
 
-Result: a ready-to-share audiobook zip, structured like this:
+Result: a ready-to-listen audiobook folder, structured like this:
 
 ```
 audiobooks/
-├── the-time-travelers-wife.zip
 └── the-time-travelers-wife/
     ├── README.md
     ├── the-time-travelers-wife - complete.mp3
@@ -108,13 +107,13 @@ cp ~/Downloads/some-book.epub epubs/
 python3 convert_books.py
 ```
 
-That's it. Watch the logs scroll by, grab your zip from `audiobooks/` when it's done.
+That's it. Watch the logs scroll by, grab your audiobook folder from `audiobooks/` when it's done.
 
-> **Speed:** chapters are rendered with 4 parallel TTS workers by default (`TTS_PARALLEL_CHUNKS=4`), so a typical 10-hour book finishes in ~25 minutes instead of ~85. On Apple Silicon (M1+) you can skip the API entirely and run **fully local** with `TTS_PROVIDER=mlx_local` — see [Local TTS on Apple Silicon (MLX)](#local-tts-on-apple-silicon-mlx) for setup.
+> **Speed:** chapters are rendered with 4 parallel TTS workers by default (`TTS_PARALLEL=4`), so a typical 10-hour book finishes in ~25 minutes instead of ~85. On Apple Silicon (M1+) you can skip the API entirely and run **fully local** with `TTS_PROVIDER=mlx_local` — see [Local TTS on Apple Silicon (MLX)](#local-tts-on-apple-silicon-mlx) for setup.
 
 ### Try a sample first (dry-run)
 
-Before committing to a full book conversion (and burning through a few dollars of TTS credits), render a short sample. `--dry-run` makes the script render only the first ~30s of the first chapter's text and stop. No zip, no full book — just one MP3 in `audiobooks/dry-run/<book>/chapters/`.
+Before committing to a full book conversion (and burning through a few dollars of TTS credits), render a short sample. `--dry-run` makes the script render only the first ~30s of the first chapter's text and stop. No full book — just one MP3 in `audiobooks/dry-run/<book>/chapters/`.
 
 ```bash
 # 30-second sample (default), uses your real TTS key once
@@ -163,29 +162,43 @@ python3 convert_books.py --resume
 
 ## Configuration
 
-Every setting lives in `.env` (gitignored). The full list:
+For normal use you only need **5 settings** in `.env` (gitignored). Everything
+else has a safe built-in default in `convert_books.py` — fewer knobs means fewer
+ways to misconfigure.
+
+### The 5 essentials
 
 | Var | Default | Notes |
 |---|---|---|
-| `TTS_PROVIDER` | `openai_compatible` | `openai_compatible` (default — any OpenAI-speech-compatible endpoint) · `elevenlabs` · `mlx_local` (Apple Silicon only) |
 | `TTS_API_KEY` | *(required)* | Your provider API key (not needed for `mlx_local`) |
 | `TTS_API_URL` | `https://openrouter.ai/api/v1/audio/speech` | OpenAI-compatible endpoint |
 | `TTS_MODEL` | `openai/gpt-4o-mini-tts-2025-12-15` | `openai/tts-1` and `openai/tts-1-hd` also work |
-| `TTS_VOICE` | `shimmer` | Any of the 13 voices supported by your model |
+| `TTS_VOICE` | `shimmer` | The "reader" — any voice supported by your model |
 | `TTS_SPEED` | `1.2` | 0.25 – 4.0 depending on provider |
-| `TTS_FORMAT` | `mp3` | mp3, opus, aac, flac, wav, pcm |
-| `TTS_INSTRUCTIONS` | British female calm narration | Only sent to `gpt-4o-mini-tts-2025-12-15` (steerable prosody) |
-| `TTS_CHUNK_CHARS` | `4000` | Per-request character cap |
+
+### Advanced overrides (optional)
+
+These have sensible built-in defaults and rarely need changing. Uncomment them
+in `.env` (see `.env.example`) only when you have a specific reason.
+
+| Var | Default | Notes |
+|---|---|---|
+| `TTS_PROVIDER` | `openai_compatible` | `openai_compatible` (default) · `elevenlabs` · `mlx_local` (Apple Silicon only) |
+| `TTS_INSTRUCTIONS` | British female calm narration | Only sent to `gpt-4o-mini-tts-*` (steerable prosody) |
+| `TTS_CHUNK_CHARS` | `2500` | Per-request character cap. Larger values make some providers (e.g. Gemini) silently truncate audio mid-chunk — keep at 2500. |
+| `TTS_VERIFY_AUDIO_LEN` / `TTS_MIN_AUDIO_RATIO` / `TTS_VERIFY_MIN_CHARS` | `1` / `0.5` / `200` | Silent-truncation guard: retries chunks whose audio is implausibly short for the input text. |
 | `TTS_MAX_RETRIES` | `4` | Retries on 429/5xx/network errors |
 | `TTS_RETRY_BACKOFF` | `2.0` | Exponential backoff base (seconds) |
 | `TTS_REQUEST_TIMEOUT` | `180` | Per-request timeout |
-| `TTS_PARALLEL_CHUNKS` | `4` | Concurrent TTS requests per chapter (1 = sequential). 4 is a good default; 8+ may hit rate limits on cloud providers. |
-| `MLX_PYTHON` | *(unset)* | Path to Python in your MLX venv — only used when `TTS_PROVIDER=mlx_local` |
-| `MLX_MODEL` | `mlx-community/Kokoro-82M-bf16` | HuggingFace MLX model — only used when `TTS_PROVIDER=mlx_local`. Kokoro is the smallest/most-reliable default. |
-| `MLX_VOICE` | model-specific | Voice name for the chosen MLX model (e.g. `af_bella` for Kokoro, see each model's HuggingFace card) |
+| `TTS_PARALLEL` | `4` | Concurrent TTS requests per chapter (1 = sequential). 8+ may hit rate limits. |
+| `TTS_FORMAT` | `mp3` | mp3, opus, aac, flac, wav, pcm |
+| `TTS_BITRATE` | `64k` | Output MP3 bitrate (spoken-word standard) |
+| `TTS_CHANNELS` | `1` | Mono (TTS is always single-channel) |
+| `CHAPTER_CONCAT_MODE` | `auto` | `auto` self-heals; rarely changed |
 | `INPUT_DIR` | `epubs` | Where to look for `.epub` files |
-| `OUTPUT_DIR` | `audiobooks` | Where to write the zipped output |
+| `OUTPUT_DIR` | `audiobooks` | Where to write the audiobook folders |
 | `LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
+| `MLX_PYTHON` / `MLX_MODEL` / `MLX_VOICE` | *(see `.env.example`)* | Only used when `TTS_PROVIDER=mlx_local` |
 
 ### Voice examples
 
@@ -207,29 +220,20 @@ TTS_VOICE=onyx
 TTS_INSTRUCTIONS="Speak in a deep, calm American male voice. Pace the narration naturally."
 ```
 
-### Three ready-to-use `.env` files (pick one)
+### Ready-to-use `.env` files (pick one)
 
-The defaults are tuned for **OpenRouter + `openai/gpt-4o-mini-tts-2025-12-15`** with a calm female voice at 1.2× speed. To switch providers, replace the contents of your `.env` with one of the blocks below.
+Each block below is a complete `.env` — just the essentials. Defaults handle the
+rest. To switch providers, replace your `.env` contents with one of these.
 
 **Option 1 — OpenAI direct (simplest, official, $0.30/M chars)**
 
 ```bash
 # .env — OpenAI direct
-TTS_PROVIDER=openai_compatible
 TTS_API_URL=https://api.openai.com/v1/audio/speech
 TTS_API_KEY=YOUR_OPENAI_KEY_HERE
 TTS_MODEL=gpt-4o-mini-tts
 TTS_VOICE=shimmer
 TTS_SPEED=1.2
-TTS_INSTRUCTIONS="Speak in a calm, warm British female voice. Pace the narration naturally for audiobook listening."
-TTS_FORMAT=mp3
-TTS_CHUNK_CHARS=4000
-TTS_MAX_RETRIES=4
-TTS_RETRY_BACKOFF=2.0
-TTS_REQUEST_TIMEOUT=180
-INPUT_DIR=epubs
-OUTPUT_DIR=audiobooks
-LOG_LEVEL=INFO
 ```
 
 Get your key at <https://platform.openai.com/api-keys>. Drop the `openai/` prefix on the model — OpenAI takes bare names.
@@ -240,21 +244,11 @@ Get your key at <https://platform.openai.com/api-keys>. Drop the `openai/` prefi
 
 ```bash
 # .env — OpenRouter
-TTS_PROVIDER=openai_compatible
 TTS_API_URL=https://openrouter.ai/api/v1/audio/speech
 TTS_API_KEY=YOUR_OPENROUTER_KEY_HERE
 TTS_MODEL=openai/gpt-4o-mini-tts-2025-12-15
 TTS_VOICE=shimmer
 TTS_SPEED=1.2
-TTS_INSTRUCTIONS="Speak in a calm, warm British female voice. Pace the narration naturally for audiobook listening."
-TTS_FORMAT=mp3
-TTS_CHUNK_CHARS=4000
-TTS_MAX_RETRIES=4
-TTS_RETRY_BACKOFF=2.0
-TTS_REQUEST_TIMEOUT=180
-INPUT_DIR=epubs
-OUTPUT_DIR=audiobooks
-LOG_LEVEL=INFO
 ```
 
 Get your key at <https://openrouter.ai/keys> (prepaid credits, ~$1-2 is enough for most books). The model name needs the `provider/` prefix — that's the only difference from Option 1.
@@ -276,7 +270,7 @@ Get your key at <https://openrouter.ai/keys> (prepaid credits, ~$1-2 is enough f
 - <https://openrouter.ai/models?modality=text-to-speech>
 - Or query the API: `curl "https://openrouter.ai/api/v1/models?output_modalities=speech"` (filter: output modality = "speech", sort by price)
 
-**Tip for very long books:** OpenRouter has rate limits per model. If you hit a 429, the script's built-in retry will back off and continue. For >20-hour books, you may want to lower `TTS_CHUNK_CHARS` to 2000 and add a small `time.sleep(0.5)` between requests to stay under the per-second quota.
+**Tip for very long books:** OpenRouter has rate limits per model. If you hit a 429, the script's built-in retry will back off and continue. The default `TTS_CHUNK_CHARS=2500` already keeps requests modest; for >20-hour books you can lower it further (e.g. 2000) to stay under per-second quotas.
 
 ---
 
@@ -288,21 +282,13 @@ ElevenLabs is the gold standard for audiobook-grade TTS. Set `TTS_PROVIDER=eleve
 # .env — ElevenLabs
 TTS_PROVIDER=elevenlabs
 TTS_API_KEY=YOUR_ELEVENLABS_KEY_HERE
-TTS_FORMAT=mp3
-TTS_CHUNK_CHARS=4000
-TTS_MAX_RETRIES=4
-TTS_RETRY_BACKOFF=2.0
-TTS_REQUEST_TIMEOUT=180
-INPUT_DIR=epubs
-OUTPUT_DIR=audiobooks
-LOG_LEVEL=INFO
 
-# ElevenLabs-specific (ignored when TTS_PROVIDER != "elevenlabs")
+# ElevenLabs-specific overrides (defaults shown; uncomment to change)
 ELEVENLABS_VOICE_ID=JBFqnCBsd6RMkjVDRZzb    # George (British, male, calm)
-ELEVENLABS_MODEL_ID=eleven_multilingual_v2  # best quality; use eleven_turbo_v2_5 for ~70% cheaper
-ELEVENLABS_STABILITY=0.5
-ELEVENLABS_SIMILARITY=0.75
-ELEVENLABS_STYLE=0.0
+# ELEVENLABS_MODEL_ID=eleven_multilingual_v2  # use eleven_turbo_v2_5 for ~70% cheaper
+# ELEVENLABS_STABILITY=0.5
+# ELEVENLABS_SIMILARITY=0.75
+# ELEVENLABS_STYLE=0.0
 ```
 
 Get your key at <https://elevenlabs.io> → Profile → API Keys.
@@ -338,24 +324,15 @@ The catch: Google doesn't expose an OpenAI-compatible TTS endpoint directly, so 
 
 ```bash
 # .env — Google Gemini TTS via OpenRouter
-TTS_PROVIDER=openai_compatible
 TTS_API_URL=https://openrouter.ai/api/v1/audio/speech
 TTS_API_KEY=YOUR_OPENROUTER_KEY_HERE
 TTS_MODEL=google/gemini-2.5-pro-preview-tts
-TTS_FORMAT=mp3
-TTS_CHUNK_CHARS=4000
-TTS_MAX_RETRIES=4
-TTS_RETRY_BACKOFF=2.0
-TTS_REQUEST_TIMEOUT=180
-INPUT_DIR=epubs
-OUTPUT_DIR=audiobooks
-LOG_LEVEL=INFO
-
-# Voice: pass via TTS_VOICE; Gemini TTS supports 30+ voice names.
-# Full list: https://ai.google.dev/gemini-api/docs/speech-generation#voice-options
 TTS_VOICE=Kore   # calm female, good default for non-fiction
 TTS_SPEED=1.2
 ```
+
+Gemini TTS supports 30+ voice names — full list:
+<https://ai.google.dev/gemini-api/docs/speech-generation#voice-options>
 
 Popular Gemini TTS voices for audiobooks:
 
@@ -436,22 +413,20 @@ The automated setup script ([`./scripts/setup_mlx.sh`](scripts/setup_mlx.sh)) in
 ```bash
 # .env — Local MLX TTS on Apple Silicon
 TTS_PROVIDER=mlx_local
-TTS_FORMAT=mp3
 
 # Path to the MLX venv Python you just created
 MLX_PYTHON=/Users/YOU/.venvs/mlx-audio/bin/python
 
-# Model: pick one. Bigger = better quality, slower.
-# Defaults to Kokoro-82M (smallest, real, well-tested).
+# Model: pick one. Bigger = better quality, slower. Defaults to Kokoro-82M.
 MLX_MODEL=mlx-community/Kokoro-82M-bf16   # 54 voices, 8 languages, ~355MB
 # MLX_MODEL=mlx-community/Spark-TTS-0.5B-bf16          # English + Chinese, ~1GB
 # MLX_MODEL=mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16  # high quality, ~3.5GB
 
-# Voice: model-specific. See HuggingFace model page for valid voices.
-# Kokoro voices: af_bella, am_adam, bf_emma, bm_george, etc.
-MLX_VOICE=af_bella
+MLX_VOICE=af_bella   # Kokoro voice; see HuggingFace model page for others
 TTS_SPEED=1.2
 ```
+
+(No `TTS_API_KEY` / `TTS_API_URL` needed — MLX runs locally.)
 
 **Why Kokoro-82M as the default:** it's the smallest (~355MB, fast download), fastest on older Apple Silicon, and has 54 voices in 8 languages. The other two are larger alternatives if you want higher quality and have the disk space / RAM.
 
@@ -484,7 +459,6 @@ TTS_API_URL=http://localhost:8080/v1/audio/speech
 TTS_API_KEY=local
 TTS_MODEL=kokoro
 TTS_VOICE=af_bella    # voice IDs vary by engine
-TTS_INSTRUCTIONS=
 ```
 
 ---

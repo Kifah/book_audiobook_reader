@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-convert_books.py — Convert EPUB files in ./epubs/ into zipped MP3 audiobooks
+convert_books.py — Convert EPUB files in ./epubs/ into MP3 audiobooks
 in ./audiobooks/ via an OpenAI-compatible TTS endpoint (default: OpenRouter).
 
 Usage:
@@ -10,7 +10,6 @@ Usage:
 
 Output:
     ./audiobooks/<book-slug>/  - per-chapter MP3s + final concatenated MP3
-    ./audiobooks/<book-slug>.zip - zipped audiobook ready to share
 """
 
 import os
@@ -19,7 +18,6 @@ import re
 import io
 import time
 import shutil
-import zipfile
 import logging
 import unicodedata
 import subprocess
@@ -93,10 +91,36 @@ TTS_INSTRUCTIONS = os.getenv(
     "Speak in a calm, warm British female voice. Pace the narration naturally, "
     "with gentle pauses at paragraph breaks. Suitable for an audiobook recording."
 )
-TTS_CHUNK_CHARS = int(os.getenv("TTS_CHUNK_CHARS", "4000"))
+# Max characters per TTS request. History: 4000 caused Gemini to silently
+# truncate audio at the chunk tail; 2500 fixed that but left INTERNAL skips
+# (the model dropping a span mid-request in long dense prose). ~600 chars keeps
+# each request short enough that the model can't lose its place. Smaller = more
+# API calls, mitigated by TTS_PARALLEL.
+TTS_CHUNK_CHARS = int(os.getenv("TTS_CHUNK_CHARS", "600"))
 TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "4"))
 TTS_RETRY_BACKOFF = float(os.getenv("TTS_RETRY_BACKOFF", "2.0"))
 TTS_REQUEST_TIMEOUT = int(os.getenv("TTS_REQUEST_TIMEOUT", "180"))
+
+# Silent-truncation guard. Some providers (notably Google Gemini on large
+# chunks) return HTTP 200 with audio that stops before the input text is
+# finished, producing abrupt mid-sentence cuts at chunk boundaries. The API
+# call "succeeds", so the HTTP-error retry path never fires. To catch this we
+# measure the returned audio duration and compare it to the duration we'd
+# expect from the input character count. If the audio is shorter than
+# (expected * TTS_MIN_AUDIO_RATIO), we treat it as a truncated render and retry.
+#
+# Empirically the engine consumes ~2400 chars per minute of *output* audio
+# regardless of TTS_SPEED (see chars_for_audio_seconds), i.e. ~40 chars/sec.
+# A short chunk legitimately has fewer "speakable" chars (whitespace, stripped
+# markup), so the ratio is intentionally loose (0.5 = audio must be at least
+# half the expected length) to avoid false positives on punctuation-heavy text.
+# Set TTS_VERIFY_AUDIO_LEN=0 to disable the check entirely.
+TTS_VERIFY_AUDIO_LEN = os.getenv("TTS_VERIFY_AUDIO_LEN", "1").strip().lower() not in ("0", "false", "no", "")
+TTS_MIN_AUDIO_RATIO = float(os.getenv("TTS_MIN_AUDIO_RATIO", "0.5"))
+# Chunks shorter than this many chars are exempt from the length check — very
+# short inputs (a heading, a one-line paragraph) have unreliable char→seconds
+# ratios and would trip false positives.
+TTS_VERIFY_MIN_CHARS = int(os.getenv("TTS_VERIFY_MIN_CHARS", "200"))
 
 # Parallel TTS requests per chapter. Cloud TTS is I/O-bound (waiting on
 # the network), so threads work well — they don't need to release the GIL
@@ -184,18 +208,17 @@ def slug_to_accent_label(slug: str) -> str:
 def chars_for_audio_seconds(seconds: float) -> int:
     """
     Budget how many characters of input text are needed to produce ~`seconds`
-    of spoken audio at TTS_SPEED.
+    of output audio.
 
-    English speech at 150 wpm, ~5 chars/word (including spaces) = 750 chars/min
-    at 1.0× speed. For `seconds` at TTS_SPEED:
-        chars = 750 * (seconds / 60) / TTS_SPEED.
-    A 20% safety margin makes the sample slightly shorter than the target
-    (TTS engines often read a bit slower than naive math, especially at
-    sentence boundaries where they pause).
+    Empirically measured: Gemini/OpenAI TTS consumes ~2400 chars/min of output
+    audio regardless of TTS_SPEED (speed affects prosody/tempo but the chars-to-
+    seconds ratio is fixed by the engine, not the speed parameter).
+        chars = 2400 * (seconds / 60)
+    A 10% safety margin keeps the sample slightly under the target duration.
     """
-    base_chars_per_min = 750.0
-    safe = max(0.1, seconds) * 0.8  # 20% margin
-    budget = base_chars_per_min * (safe / 60.0) / max(0.25, TTS_SPEED)
+    base_chars_per_min = 2400.0
+    safe = max(0.1, seconds) * 0.9  # 10% margin
+    budget = base_chars_per_min * (safe / 60.0)
     return max(200, int(budget))
 
 
@@ -260,11 +283,37 @@ def extract_chapters(epub_path: Path) -> dict:
         else:
             title = Path(item.get_name()).stem
 
-        # Strip everything non-textual, keep paragraph breaks
+        # Convert in-body subheadings to spoken sentences so they don't end
+        # up as dangling punctuation-free fragments at chunk boundaries.
+        # e.g. <h3>Ancient Gaza as a trading hub</h3>  ->  "Ancient Gaza as a trading hub."
+        for htag in soup.find_all(["h2", "h3", "h4"]):
+            heading_text = htag.get_text(" ", strip=True).strip()
+            if heading_text and not heading_text.endswith((".", "!", "?")):
+                heading_text += "."
+            htag.replace_with(f"\n\n{heading_text}\n\n")
+
+        # Remove page-break spans (e.g. <span epub:type="pagebreak"/>) — they
+        # contain no text but leave stray whitespace after get_text().
+        for span in soup.find_all("span", attrs={"epub:type": "pagebreak"}):
+            span.decompose()
+
+        # Merge blockquotes into the preceding paragraph so the lead-in sentence
+        # ("Author writes:") and the quoted text stay in the same chunk and the
+        # TTS reads them together without an abrupt break between them.
+        for bq in soup.find_all("blockquote"):
+            bq.unwrap()
+
+        # Insert explicit paragraph breaks before extracting text.
+        # get_text("\n") collapses <p>...</p><p>...</p> into a single newline,
+        # making entire chapters one giant paragraph and breaking chunk_text.
+        for tag in soup.find_all(["p", "h1", "li"]):
+            tag.insert_before("\n\n")
+            tag.insert_after("\n\n")
         for br in soup.find_all("br"):
             br.replace_with("\n")
-        text = soup.get_text("\n", strip=True)
-        # Collapse runs of blank lines
+        text = soup.get_text(" ", strip=False)
+        # Collapse runs of blank lines and stray whitespace-only lines
+        text = re.sub(r"\n[ \t]+\n", "\n\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         if not text:
             continue
@@ -284,7 +333,11 @@ def extract_chapters(epub_path: Path) -> dict:
 # normalizes the text so short common words like "of" and "the" don't get
 # stuck next to awkward punctuation, and runs of whitespace don't get
 # interpreted as sentence breaks.
-_MULTI_SPACE = re.compile(r"[ \t]{2,}")
+_MULTI_SPACE = re.compile(r"[ \t\u00a0\u2000-\u200a\u202f\u205f\u3000]{2,}")
+# TOC bleed: a page number wedged between two title words via non-breaking
+# spaces, e.g. "Palestine\u00a018\u00a0\u00a0City of Oranges". The lone number is a
+# page reference, not prose — drop it so TTS doesn't read "...Palestine 18 City".
+_TOC_PAGENUM = re.compile(r"(?<=[A-Za-z\u00bf-\u024f])[\u00a0\s]+\d{1,4}[\u00a0\s]+(?=[A-Z])")
 _SMALL_WORDS = (
     r"(?:a|an|the|of|in|on|at|to|for|by|with|and|or|but|is|was|are|were|"
     r"be|been|has|have|had|it|its|he|she|his|her|they|them|their|"
@@ -374,8 +427,12 @@ def clean_for_tts(text: str) -> str:
     # 3. Em-dash / en-dash -> ", " (mild pause, no breath). This catches the
     #    remaining word-level dashes like "Palestine\u2013Egypt".
     text = text.replace("\u2014", ", ").replace("\u2013", ", ")
-    # 4. Collapse runs of whitespace (incl. tabs)
+    # 4. Strip TOC page-number bleed ("Title 18  Next Title" -> "Title Next
+    #    Title"). Runs BEFORE whitespace collapse so the NBSP run still matches.
+    text = _TOC_PAGENUM.sub(" ", text)
+    # 5. Collapse runs of whitespace (incl. tabs and non-breaking spaces)
     text = _MULTI_SPACE.sub(" ", text)
+    text = text.replace("\u00a0", " ")  # any lone non-breaking space -> space
     # 5. Remove the space between a short word and the punctuation that follows.
     #    The regex matches `<word> <punct>` and we just drop the space.
     text = _SMALL_WORD_PUNCT.sub(r"\1\2", text)
@@ -404,7 +461,26 @@ def clean_for_tts(text: str) -> str:
     #     heuristic is safe: compounds like "well-known" don't match because
     #     "well" doesn't end in -ly.
     text = _LY_HYPHEN.sub(r"\1 and \2", text)
-    # 12. Final whitespace tidy (collapse newlines we may have created)
+    # 12. Strip non-Latin/non-ASCII characters that TTS engines cannot pronounce
+    #     (Greek, Arabic, Hebrew, CJK, etc. from inline <em> scholarly terms).
+    #     Keep: basic Latin, extended Latin (accented chars like é, ü, ñ),
+    #     curly quotes/apostrophes, common punctuation, digits, and whitespace.
+    text = re.sub(r"[^\x00-\x7F\u00C0-\u024F\u2018-\u201F\u2013\u2014\u2026\s]", "", text)
+    # 13. Clean up artefacts left by earlier substitutions:
+    #     ", ."  -> "."   (comma-space before period from paren/dash cleanup)
+    #     ", ,"  -> ","   (double comma from nested paren cleanup)
+    #     " ."   -> "."   (stray space before period)
+    text = re.sub(r",\s+\.", ".", text)
+    text = re.sub(r",\s+,", ",", text)
+    text = re.sub(r"\s+\.", ".", text)
+    # 14. Merge paragraph breaks where the preceding paragraph ends without
+    #     sentence-ending punctuation (lead-in sentences that introduce a
+    #     blockquote or other continuation). Replace \n\n with a single space
+    #     so the TTS reads through without a gap.
+    #     e.g. "...Palestinian scholar Shukri 'Arraf\n\ntakes us on a rich..." ->
+    #          "...Palestinian scholar Shukri 'Arraf takes us on a rich..."
+    text = re.sub(r"([^.!?])\n\n+", r"\1 ", text)
+    # 15. Final whitespace tidy (collapse newlines we may have created)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -440,10 +516,27 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
                     if buf:
                         chunks.append(buf.strip())
                         buf = ""
-                # Last-resort: hard-split a single huge sentence
+                # Last-resort: split a huge sentence at sentence > word > char boundary
                 while len(sent) > max_chars:
-                    chunks.append(sent[:max_chars])
-                    sent = sent[max_chars:]
+                    window = sent[:max_chars]
+                    cut = -1
+                    for sep in (". ", "! ", "? "):
+                        idx = window.rfind(sep)
+                        if idx > cut:
+                            cut = idx + len(sep) - 1  # keep the punctuation, drop the space
+                    if cut > max_chars * 0.3:
+                        chunks.append(sent[: cut + 1].strip())
+                        sent = sent[cut + 1 :].strip()
+                    else:
+                        # No sentence boundary — try word boundary
+                        idx = window.rfind(" ")
+                        if idx > max_chars * 0.3:
+                            chunks.append(sent[:idx].strip())
+                            sent = sent[idx:].strip()
+                        else:
+                            # True last resort: hard character split
+                            chunks.append(sent[:max_chars])
+                            sent = sent[max_chars:]
                 buf = (buf + " " + sent).strip() if buf else sent
             continue
 
@@ -583,9 +676,10 @@ def _pcm_chunks_to_mp3(pcm_files: list[Path], out_path: Path) -> None:
     ]
     log.debug("    [pcm-chunks] ffmpeg cmd=%s, files=%d", ffmpeg_cmd, len(pcm_files))
 
-    # Create 200ms silence gap between chunks for smooth transitions.
-    # 24kHz, 16-bit mono: 24000 samples/sec × 0.2 sec × 2 bytes/sample = 9600 bytes
-    silence_gap = b"\x00" * 9600  # 200ms of silence at 24kHz 16-bit mono
+    # Create 50ms silence gap between chunks for smooth transitions.
+    # 24kHz, 16-bit mono: 24000 samples/sec × 0.05 sec × 2 bytes/sample = 2400 bytes
+    # This provides a natural pause without making the audio feel disconnected.
+    silence_gap = b"\x00" * 2400  # 50ms of silence at 24kHz 16-bit mono
 
     # Read all PCM chunks into memory with silence gaps between them.
     # For a 30-min chapter at 24kHz 16-bit mono, the combined PCM is
@@ -795,8 +889,54 @@ _TTS_PROVIDERS = {
 }
 
 
+_PCM_BYTES_PER_SECOND = 24000 * 2 * 1  # 24kHz, 16-bit, mono
+
+
+def _audio_duration_seconds(audio: bytes) -> float:
+    """Measure the playback duration of TTS output bytes.
+
+    openai_compatible and mlx_local return raw PCM (24kHz/16-bit/mono), whose
+    duration is exact byte arithmetic. ElevenLabs returns MP3, which has no
+    fixed bytes-per-second, so we probe it with ffprobe. Returns 0.0 when the
+    duration cannot be determined (treated as "unknown", never as truncation).
+    """
+    if not audio:
+        return 0.0
+    if TTS_PART_FORMAT == "pcm":
+        return len(audio) / _PCM_BYTES_PER_SECOND
+    if not ffmpeg_available():
+        return 0.0
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", "pipe:0"],
+            input=audio, capture_output=True, timeout=30,
+        )
+        return float(proc.stdout.decode(errors="ignore").strip() or 0.0)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return 0.0
+
+
+def _is_truncated(text: str, audio: bytes) -> bool:
+    """Heuristic: True if `audio` is implausibly short for `text`'s length.
+
+    Catches the silent-truncation failure mode where a provider returns a 200
+    response with audio that stops before the input text finishes. Inverts the
+    chars_for_audio_seconds budget (~2400 chars/min) to derive the expected
+    duration, then flags audio shorter than TTS_MIN_AUDIO_RATIO of it.
+    """
+    if not TTS_VERIFY_AUDIO_LEN or len(text) < TTS_VERIFY_MIN_CHARS:
+        return False
+    expected = (len(text) / 2400.0) * 60.0
+    actual = _audio_duration_seconds(audio)
+    if actual <= 0.0:
+        return False  # could not measure — don't false-positive
+    return actual < expected * TTS_MIN_AUDIO_RATIO
+
+
 def tts_one_chunk(text: str) -> bytes:
-    """Dispatch a TTS request to the configured provider, with retry on transient errors."""
+    """Dispatch a TTS request to the configured provider, retrying on transient
+    HTTP/network errors AND on silently-truncated audio (see _is_truncated)."""
     if TTS_PROVIDER not in _TTS_PROVIDERS:
         raise RuntimeError(
             f"Unknown TTS_PROVIDER={TTS_PROVIDER!r}. "
@@ -807,7 +947,28 @@ def tts_one_chunk(text: str) -> bytes:
     last_err = None
     for attempt in range(1, TTS_MAX_RETRIES + 1):
         try:
-            return impl(text)
+            audio = impl(text)
+            if _is_truncated(text, audio):
+                got = _audio_duration_seconds(audio)
+                want = (len(text) / 2400.0) * 60.0
+                last_err = (
+                    f"truncated audio: got {got:.1f}s for {len(text)} chars "
+                    f"(expected ~{want:.1f}s)"
+                )
+                if attempt < TTS_MAX_RETRIES:
+                    wait = TTS_RETRY_BACKOFF * attempt
+                    log.warning(
+                        "Chunk truncated (attempt %d/%d, %s) — retrying in %.1fs",
+                        attempt, TTS_MAX_RETRIES, last_err, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(
+                    f"TTS returned {last_err} after {TTS_MAX_RETRIES} attempts. "
+                    f"Lower TTS_CHUNK_CHARS (current {TTS_CHUNK_CHARS}) — this "
+                    f"provider truncates long inputs."
+                )
+            return audio
         except error.HTTPError as e:
             detail = e.read()[:300].decode("utf-8", errors="ignore")
             last_err = f"HTTP {e.code}: {detail}"
@@ -1120,15 +1281,15 @@ def render_chapter(title: str, text: str, out_path: Path, tmp_dir: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# Book → folder + zip
+# Book → folder
 # ---------------------------------------------------------------------------
 
 def convert_book(epub_path: Path) -> Path:
-    """Convert one EPUB to a per-chapter folder, a concatenated MP3, and a zip.
+    """Convert one EPUB to a per-chapter folder and a concatenated full-book MP3.
 
     In DRY_RUN mode, only the first ~DRY_RUN_SECONDS of the first chapter are
-    converted (1 small TTS call). No zip is created. Output goes to a
-    `dry-run/` subfolder under OUTPUT_DIR so it doesn't pollute real runs.
+    converted (1 small TTS call). Output goes to a `dry-run/` subfolder under
+    OUTPUT_DIR so it doesn't pollute real runs.
     """
     parsed = extract_chapters(epub_path)
     book_title = parsed["title"]
@@ -1172,18 +1333,40 @@ def convert_book(epub_path: Path) -> Path:
     if DRY_RUN:
         log.warning("=" * 60)
         log.warning("DRY RUN — only the first ~%.0fs of the first non-empty chapter will be rendered.", DRY_RUN_SECONDS)
-        log.warning("DRY RUN — no zip will be produced, full book will be skipped.")
+        log.warning("DRY RUN — the full book will be skipped.")
         log.warning("DRY RUN — your TTS key IS still used (this calls the real TTS API).")
         log.warning("=" * 60)
-        # Build a synthetic single-chapter "sample" from the first chapter with real text
-        sample_source = next(
-            (c for c in chapters if len(c["text"].strip()) > 500),
-            chapters[0],
+        # Build a synthetic single-chapter "sample" by concatenating chapters
+        # until the character budget is met (the first chapter alone may be
+        # shorter than the requested dry-run duration).
+        budget = chars_for_audio_seconds(DRY_RUN_SECONDS)
+        collected: list[str] = []
+        collected_chars = 0
+        first_title = None
+        for c in chapters:
+            t = c["text"].strip()
+            if not t or len(t) < 50:
+                continue
+            if first_title is None:
+                first_title = c["title"]
+            remaining = budget - collected_chars
+            if len(t) <= remaining:
+                collected.append(t)
+                collected_chars += len(t)
+            else:
+                # Slice the last chapter at a sentence boundary
+                collected.append(slice_for_dry_run(t, DRY_RUN_SECONDS * (remaining / budget)))
+                collected_chars = budget
+                break
+            if collected_chars >= budget:
+                break
+        sample_text = "\n\n".join(collected)
+        log.info(
+            "Sample text: %d chars across %d chapter(s), targeting ~%.0fs",
+            len(sample_text), len(collected), DRY_RUN_SECONDS,
         )
-        sample_text = slice_for_dry_run(sample_source["text"], DRY_RUN_SECONDS)
-        log.info("Sample text: %d chars (from chapter '%s')", len(sample_text), sample_source["title"])
         sample_chapter = {
-            "title": f"{sample_source['title']} (sample)",
+            "title": f"{first_title or 'Sample'} (sample)",
             "text": sample_text,
         }
         chapters = [sample_chapter]
@@ -1293,18 +1476,8 @@ def convert_book(epub_path: Path) -> Path:
     # Cleanup temp
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Zip the audiobook (folder, not nested zip)
-    zip_path = OUTPUT_DIR / f"{book_slug}.zip"
-    if zip_path.exists():
-        zip_path.unlink()
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(work_dir):
-            for name in files:
-                full = Path(root) / name
-                arc = full.relative_to(work_dir.parent)
-                zf.write(full, arc)
-    log.info("Wrote %s (%.1f MB)", zip_path, zip_path.stat().st_size / (1024 * 1024))
-    return zip_path
+    log.info("Wrote audiobook folder: %s", work_dir)
+    return work_dir
 
 
 # ---------------------------------------------------------------------------
@@ -1316,12 +1489,12 @@ def _parse_args(argv: list[str] | None = None) -> dict:
     import argparse
     p = argparse.ArgumentParser(
         prog="convert_books.py",
-        description="Convert EPUB files in ./epubs/ to zipped MP3 audiobooks.",
+        description="Convert EPUB files in ./epubs/ to MP3 audiobooks.",
     )
     p.add_argument(
         "--dry-run", dest="dry_run", action="store_true",
         help="Render only the first ~30s of the first book (or --book) and stop. "
-             "No zip, no full-book output. Useful for testing voice/quality before "
+             "No full-book output. Useful for testing voice/quality before "
              "committing to a full conversion. STILL USES YOUR TTS KEY (1 API call).",
     )
     p.add_argument(
@@ -1431,7 +1604,7 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("ffmpeg not found in PATH — falling back to raw byte concat. "
                     "Install ffmpeg for cleaner chapter joins.")
     if DRY_RUN:
-        log.info("DRY RUN mode — will render ~%.0fs per book, no zips.", DRY_RUN_SECONDS)
+        log.info("DRY RUN mode — will render ~%.0fs per book.", DRY_RUN_SECONDS)
     if CONTINUE_RUN:
         if DRY_RUN:
             log.error("--continue and --dry-run are incompatible. Pick one.")
