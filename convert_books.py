@@ -125,11 +125,11 @@ TTS_VERIFY_MIN_CHARS = int(os.getenv("TTS_VERIFY_MIN_CHARS", "200"))
 # Parallel TTS requests per chapter. Cloud TTS is I/O-bound (waiting on
 # the network), so threads work well — they don't need to release the GIL
 # because most of the time is spent in urlopen(), not Python bytecode.
-# For 12 chunks at 2s each sequential = 24s, with 4 parallel = 6s, with
-# 8 parallel = 3s. Cloud providers typically handle 8-16 concurrent
-# requests fine; above that you may hit rate limits.
+# At the 600-char default chunk size, a typical chapter has 50-500+ chunks,
+# so 8-12 workers is the sweet spot (cloud providers handle 8-16 concurrent
+# requests fine; above that you may hit rate limits).
 # Set to 1 to disable parallelism (e.g. for rate-limited OpenRouter tiers).
-TTS_PARALLEL = max(1, int(os.getenv("TTS_PARALLEL", "4")))
+TTS_PARALLEL = max(1, int(os.getenv("TTS_PARALLEL", "8")))
 
 # Format of intermediate TTS part files saved to disk before chapter concat.
 # For openai_compatible providers (OpenAI, OpenRouter/Kokoro/Orpheus, Gemini),
@@ -1168,8 +1168,10 @@ def _render_chunks_parallel(
     t0 = time.perf_counter()
 
     def _render_one(idx: int, chunk: str) -> tuple[int, Path]:
-        audio = tts_one_chunk(chunk)
         part_path = tmp_dir / f"part_{idx + 1:04d}.{part_format}"
+        if part_path.exists() and part_path.stat().st_size > 0:
+            return idx, part_path  # already on disk — skip API call
+        audio = tts_one_chunk(chunk)
         with open(part_path, "wb") as f:
             f.write(audio)
         return idx, part_path
@@ -1225,13 +1227,26 @@ def render_chapter(title: str, text: str, out_path: Path, tmp_dir: Path) -> None
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    # On resume: delete the highest-numbered part file that exists — it was
+    # the chunk in-flight when the previous run was interrupted and may be
+    # partially written. All lower-numbered parts are safe to reuse.
+    existing = sorted(tmp_dir.glob(f"part_*.{TTS_PART_FORMAT}"))
+    if existing:
+        last = existing[-1]
+        last.unlink()
+        log.info("    Dropped possibly-incomplete part %s — will re-render it", last.name)
+
     if TTS_PARALLEL == 1 or len(chunks) == 1:
         # Sequential path (no parallelism). Same as before.
         part_files: list[Path] = []
         for i, chunk in enumerate(chunks, start=1):
+            part_path = tmp_dir / f"part_{i:04d}.{TTS_PART_FORMAT}"
+            if part_path.exists() and part_path.stat().st_size > 0:
+                log.info("    [%d/%d]  cached (skipping API call)", i, len(chunks))
+                part_files.append(part_path)
+                continue
             log.info("    [%d/%d]  TTS %d chars…", i, len(chunks), len(chunk))
             audio = tts_one_chunk(chunk)
-            part_path = tmp_dir / f"part_{i:04d}.{TTS_PART_FORMAT}"
             with open(part_path, "wb") as f:
                 f.write(audio)
             part_files.append(part_path)
