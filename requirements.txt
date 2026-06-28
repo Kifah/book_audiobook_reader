@@ -2,3 +2,8 @@ ebooklib>=0.18
 beautifulsoup4>=4.12
 lxml>=5.0
 python-dotenv>=1.0
+pypdf>=4.0
+
+# Optional: install only if you want TTS_PROVIDER=piper_local (free local TTS)
+#   pip install piper-tts
+# Adds ~100MB (onnxruntime). Voice models download separately to piper_voices/.

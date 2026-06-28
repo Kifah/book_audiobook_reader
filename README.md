@@ -48,14 +48,14 @@ It's deliberately **provider-agnostic** — anything that speaks the OpenAI `/v1
 
 The script itself is **pure Python + ffmpeg** and runs anywhere Python 3.10+ runs. The constraints come from which **TTS provider** you choose, not from the script. Here's the honest matrix:
 
-| Platform | `openai_compatible` (OpenRouter, OpenAI, etc.) | `elevenlabs` | `mlx_local` |
-|---|---|---|---|
-| **macOS Apple Silicon** (M1/M2/M3/M4/M5) | ✅ | ✅ | ✅ **best option** |
-| **macOS Intel** (pre-2020) | ✅ | ✅ | ❌ MLX requires Apple Silicon |
-| **Linux** (x86_64, any distro) | ✅ | ✅ | ❌ MLX is Apple-only |
-| **Linux** (ARM64, e.g. Raspberry Pi, Graviton) | ✅ | ✅ | ❌ |
-| **Windows** 10/11 (x86_64) | ✅ | ✅ | ❌ |
-| **Windows** (ARM64, Surface Pro X etc.) | ✅ | ✅ | ❌ |
+| Platform | `openai_compatible` (OpenRouter, OpenAI, etc.) | `elevenlabs` | `piper_local` | `mlx_local` |
+|---|---|---|---|---|
+| **macOS Apple Silicon** (M1/M2/M3/M4/M5) | ✅ | ✅ | ✅ | ✅ **fastest local** |
+| **macOS Intel** (pre-2020) | ✅ | ✅ | ✅ | ❌ MLX requires Apple Silicon |
+| **Linux** (x86_64, any distro) | ✅ | ✅ | ✅ | ❌ MLX is Apple-only |
+| **Linux** (ARM64, e.g. Raspberry Pi, Graviton) | ✅ | ✅ | ✅ | ❌ |
+| **Windows** 10/11 (x86_64) | ✅ | ✅ | ✅ | ❌ |
+| **Windows** (ARM64, Surface Pro X etc.) | ✅ | ✅ | ✅ | ❌ |
 
 **What this means in practice:**
 
@@ -183,7 +183,7 @@ in `.env` (see `.env.example`) only when you have a specific reason.
 
 | Var | Default | Notes |
 |---|---|---|
-| `TTS_PROVIDER` | `openai_compatible` | `openai_compatible` (default) · `elevenlabs` · `mlx_local` (Apple Silicon only) |
+| `TTS_PROVIDER` | `openai_compatible` | `openai_compatible` (default) · `elevenlabs` · `piper_local` · `mlx_local` (Apple Silicon only) |
 | `TTS_INSTRUCTIONS` | British female calm narration | Only sent to `gpt-4o-mini-tts-*` (steerable prosody) |
 | `TTS_CHUNK_CHARS` | `2500` | Per-request character cap. Larger values make some providers (e.g. Gemini) silently truncate audio mid-chunk — keep at 2500. |
 | `TTS_VERIFY_AUDIO_LEN` / `TTS_MIN_AUDIO_RATIO` / `TTS_VERIFY_MIN_CHARS` | `1` / `0.5` / `200` | Silent-truncation guard: retries chunks whose audio is implausibly short for the input text. |
@@ -199,6 +199,7 @@ in `.env` (see `.env.example`) only when you have a specific reason.
 | `OUTPUT_DIR` | `audiobooks` | Where to write the audiobook folders |
 | `LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
 | `MLX_PYTHON` / `MLX_MODEL` / `MLX_VOICE` | *(see `.env.example`)* | Only used when `TTS_PROVIDER=mlx_local` |
+| `PIPER_VOICE_PATH` / `PIPER_BIN` | *(see `.env.example`)* | Only used when `TTS_PROVIDER=piper_local` |
 
 ### Voice examples
 
@@ -450,6 +451,61 @@ python3 convert_books.py --dry-run
 
 **The M5 makes local TTS the obvious choice** for personal audiobooks: free, fast, no rate limits, no API keys. Cloud is still better for one-off professional work where every word matters, but for converting your own library, local is the winner.
 
+**Option 6 — Local Piper TTS (free, $0/M, runs on any CPU)**
+
+[Piper](https://github.com/rhasspy/piper) is a fast, local, neural TTS engine that uses ONNX models. Unlike MLX, it has no Apple Silicon dependency — it runs on plain CPU on any platform (Mac/Linux/Windows). Quality is between concatenative engines (`say`, `espeak`) and high-end cloud TTS — comparable to Kokoro for narration, with naturally-paced prosody trained on real audiobook recordings.
+
+**Why pick Piper over MLX:** runs anywhere, single `pip install`, no broken model versions, no GPU/Metal dependency. Tradeoff: slower than MLX on M-series (CPU-only), and the highest-quality voices (`-high` tier) aren't quite as natural as Gemini or ElevenLabs.
+
+**Setup:**
+
+```bash
+# 1. Install (in the same venv that runs convert_books.py)
+pip install piper-tts
+
+# 2. Download a voice (~60-115 MB per voice)
+mkdir -p piper_voices && cd piper_voices
+curl -LO https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx
+curl -LO https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx.json
+cd ..
+
+# 3. Configure .env
+cat > .env <<'EOF'
+TTS_PROVIDER=piper_local
+PIPER_VOICE_PATH=piper_voices/en_US-ryan-high.onnx
+TTS_SPEED=1.2
+EOF
+```
+
+**Voice catalog:** browse + listen to all Piper voices at <https://rhasspy.github.io/piper-samples/>. Voice naming convention is `<lang>_<region>-<speaker>-<quality>.onnx`:
+
+| Voice | Vibe | Tier |
+|---|---|---|
+| `en_US-ryan-high` | US male, narrative, audiobook-style | high (~115MB) |
+| `en_US-lessac-high` | US female, neutral, clear | high (~109MB) |
+| `en_US-libritts_r-medium` | US female, multi-speaker (904 voices) | medium (~75MB) |
+| `en_US-amy-medium` | US female, friendly | medium (~60MB) |
+| `en_GB-alan-medium` | UK male, traditional narrator | medium (~60MB) |
+| `en_GB-jenny_dioco-medium` | UK female, conversational | medium (~60MB) |
+
+Lower-quality `-low` and `-medium` tiers are smaller and faster but more robotic. The `-high` tier is recommended for audiobook narration.
+
+**Performance (M-series Mac, single-threaded):**
+
+| Voice tier | Realtime factor | 10-hour book |
+|---|---|---|
+| `-medium` | ~13-21× realtime | ~30-45 min |
+| `-high` | ~5× realtime | ~2 hours |
+
+`TTS_PARALLEL=8` (the default) gives a roughly linear speedup on multi-core CPUs since piper releases the GIL during ONNX inference.
+
+**Speed control:** Piper uses `--length-scale` (the inverse of speed). The script automatically maps `TTS_SPEED → 1/TTS_SPEED`, so `TTS_SPEED=1.2` → length-scale 0.833 (faster). Range: 0.5–2.0 in practice.
+
+**Troubleshooting:**
+- `piper executable not found` → `pip install piper-tts` in the same venv (or set `PIPER_BIN=/path/to/piper`)
+- `Piper voice file not found` → check `PIPER_VOICE_PATH` is correct; needs both `.onnx` and `.onnx.json` sidecar
+- Audio sounds robotic → try a `-high` tier voice (much better than `-medium`/`-low`)
+
 ### Using a self-hosted model
 
 Any OpenAI-compatible audio endpoint will work. Example for [Kokoro-82M](https://github.com/remsky/Kokoro-82M) via a LocalAI-style proxy:
@@ -479,6 +535,7 @@ Prices are per **1M characters of generated audio**. A 3-hour audiobook ≈ 180 
 | ElevenLabs `turbo_v2_5` | ~$30 | ~$100 | Best |
 | ElevenLabs `multilingual_v2` | ~$32 | ~$108 | Best (most expensive) |
 | **MLX local on Apple Silicon** | **$0** (your Mac) | **$0** | Very good |
+| **Piper local (any CPU)** | **$0** (your machine) | **$0** | Good (`-high` voices comparable to Kokoro) |
 
 **Sweet spot for non-fiction audiobooks:** Google Gemini TTS via OpenRouter. ~$0.20 for a 3-hour book, much better text normalization than Kokoro, no ElevenLabs-tier pricing.
 

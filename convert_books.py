@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-convert_books.py — Convert EPUB files in ./epubs/ into MP3 audiobooks
-in ./audiobooks/ via an OpenAI-compatible TTS endpoint (default: OpenRouter).
+convert_books.py — Convert EPUB, plain-text (.txt), or PDF files in ./epubs/
+into MP3 audiobooks in ./audiobooks/ via an OpenAI-compatible TTS endpoint
+(default: OpenRouter).
 
 Usage:
-    1. Drop one or more .epub files in ./epubs/
+    1. Drop one or more .epub, .txt, or .pdf files in ./epubs/
     2. Copy .env.example to .env and fill in your TTS_API_KEY
     3. python3 convert_books.py
 
 Output:
     ./audiobooks/<book-slug>/  - per-chapter MP3s + final concatenated MP3
+
+Notes on PDF support:
+    Only text-layer PDFs are supported (most modern/digital book PDFs).
+    Scanned/image PDFs will be rejected with a clear error message — use an
+    OCR tool (e.g. ocrmypdf) to add a text layer first.
 """
 
 import os
@@ -18,6 +24,7 @@ import re
 import io
 import time
 import shutil
+import tempfile
 import logging
 import unicodedata
 import subprocess
@@ -33,6 +40,12 @@ except ImportError:
         "Missing dependencies. Install with:\n"
         "  pip install -r requirements.txt"
     )
+
+try:
+    import pypdf as _pypdf
+    _PYPDF_AVAILABLE = True
+except ImportError:
+    _PYPDF_AVAILABLE = False
 
 try:
     from dotenv import load_dotenv
@@ -56,6 +69,9 @@ DRY_RUN_SECONDS = 30.0  # approximate; we budget by chars not actual time
 CONTINUE_RUN = False
 # Skip-front-matter flag (set by --skip-front-matter CLI flag; default True)
 SKIP_FRONT_MATTER = True
+# Number of leading chapters to drop before rendering, for any input format
+# (set by --skip-chapters CLI flag; overrides the SKIP_CHAPTERS env var).
+SKIP_CHAPTERS = 0
 # Clean-for-tts flag (set by --clean / --no-clean CLI flag; default True)
 CLEAN_FOR_TTS = True
 
@@ -132,11 +148,12 @@ TTS_VERIFY_MIN_CHARS = int(os.getenv("TTS_VERIFY_MIN_CHARS", "200"))
 TTS_PARALLEL = max(1, int(os.getenv("TTS_PARALLEL", "8")))
 
 # Format of intermediate TTS part files saved to disk before chapter concat.
-# For openai_compatible providers (OpenAI, OpenRouter/Kokoro/Orpheus, Gemini),
-# we save raw PCM (24kHz 16-bit mono) — no ffmpeg overhead per chunk.
-# The chapter-level concat encodes all parts to MP3 in a single pass.
-# For ElevenLabs, we save MP3 (their API returns MP3 directly).
-TTS_PART_FORMAT = "pcm" if TTS_PROVIDER == "openai_compatible" else TTS_FORMAT
+# Providers that return raw PCM (24kHz 16-bit mono) — openai_compatible,
+# mlx_local, piper_local — save part files as .pcm (no ffmpeg per chunk;
+# chapter concat encodes all parts to MP3 in one pass).
+# ElevenLabs returns MP3 directly, so its parts stay as .mp3.
+_PCM_PROVIDERS = {"openai_compatible", "mlx_local", "piper_local"}
+TTS_PART_FORMAT = "pcm" if TTS_PROVIDER in _PCM_PROVIDERS else TTS_FORMAT
 
 # Concat strategy for joining TTS-rendered MP3 chunks:
 #   "auto"     - try -c copy (fast, ~1s/chapter) first; on DTS error, fall back
@@ -158,6 +175,7 @@ TTS_BITRATE = os.getenv("TTS_BITRATE", "64k").strip()
 TTS_CHANNELS = int(os.getenv("TTS_CHANNELS", "1"))
 
 INPUT_DIR = Path(os.getenv("INPUT_DIR", "epubs"))
+SUPPORTED_EXTENSIONS = {".epub", ".txt", ".pdf"}
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "audiobooks"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -167,6 +185,21 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 SKIP_FRONT_MATTER_PATTERNS = [
     p.strip().lower() for p in os.getenv("SKIP_FRONT_MATTER_PATTERNS", "").split(",") if p.strip()
 ] or list(DEFAULT_SKIP_PATTERNS)
+
+SKIP_CHAPTERS = max(0, int(os.getenv("SKIP_CHAPTERS", "0") or "0"))
+
+# Lines containing any of these strings (case-insensitive) are dropped from
+# every chapter before TTS, across all formats — e.g. per-page watermarks like
+# "Machine Translated by Google". The STRIP_STRINGS env var (comma-separated) is
+# appended to these defaults; set STRIP_STRINGS_OVERRIDE=1 to replace them.
+DEFAULT_STRIP_STRINGS = [
+    "Machine Translated by Google",
+]
+_env_strip = [s.strip() for s in os.getenv("STRIP_STRINGS", "").split(",") if s.strip()]
+if os.getenv("STRIP_STRINGS_OVERRIDE", "").strip().lower() in ("1", "true", "yes"):
+    STRIP_STRINGS = _env_strip
+else:
+    STRIP_STRINGS = list(DEFAULT_STRIP_STRINGS) + _env_strip
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -325,6 +358,249 @@ def extract_chapters(epub_path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Plain-text (.txt) parsing
+# ---------------------------------------------------------------------------
+
+# A line is treated as a chapter heading if it matches one of these patterns:
+#   • ALL-CAPS line (at least 3 chars, no terminal punctuation in mid-word)
+#   • "Chapter N" / "Part N" / "Book N" (digits or Roman numerals)
+#   • A short line (≤80 chars) followed immediately by a blank line
+# The ALL-CAPS branch is case-sensitive on purpose: under re.IGNORECASE the
+# [A-Z] class also matches lowercase, so it would match ordinary prose lines.
+# The keyword branch opts into case-insensitivity via an inline (?i:...) group.
+_TXT_HEADING = re.compile(
+    r"^(?:"
+    r"(?i:(?:chapter|part|book|section|prologue|epilogue|introduction|preface|afterword)"
+    r"[\s\u00a0]*(?:[IVXLCDM]+|\d+)?(?:[:\.\s].*)?)$"
+    r"|[A-Z][A-Z\s\d\u2013\u2014\-]{2,}[A-Z\d]"
+    r")",
+)
+
+
+def extract_chapters_txt(txt_path: Path) -> dict:
+    """
+    Parse a plain-text file into book title + chapters.
+
+    Chapter detection (in priority order):
+      1. Lines matching _TXT_HEADING (e.g. "Chapter 1", "PART TWO", "Prologue")
+      2. A short line (≤80 chars) that is surrounded by blank lines on both sides
+      3. If no headings are found at all, treat the whole file as one chapter.
+
+    The book title defaults to the file stem (e.g. "my_book.txt" → "My Book").
+    """
+    log.info("Parsing TXT: %s", txt_path.name)
+    raw = txt_path.read_text(encoding="utf-8", errors="replace")
+
+    # Derive book title from filename stem
+    book_title = txt_path.stem.replace("_", " ").replace("-", " ").title()
+
+    lines = raw.splitlines()
+    total = len(lines)
+
+    # ------------------------------------------------------------------ #
+    # Pass 1: locate heading line indices                                  #
+    # ------------------------------------------------------------------ #
+    heading_indices: list[int] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Pattern match
+        if _TXT_HEADING.match(stripped):
+            heading_indices.append(i)
+            continue
+        # Short line surrounded by blank lines on both sides
+        if (
+            len(stripped) <= 80
+            and (i == 0 or not lines[i - 1].strip())
+            and (i == total - 1 or not lines[i + 1].strip())
+        ):
+            heading_indices.append(i)
+
+    # ------------------------------------------------------------------ #
+    # Pass 2: slice lines into chapters                                    #
+    # ------------------------------------------------------------------ #
+    chapters: list[dict] = []
+
+    if not heading_indices:
+        # No structure detected — treat entire file as one chapter
+        text = re.sub(r"\n{3,}", "\n\n", raw).strip()
+        if text:
+            chapters.append({"title": book_title, "text": text})
+    else:
+        # Each heading starts a new chapter; body = lines between this heading
+        # and the next heading (exclusive).
+        boundaries = heading_indices + [total]  # sentinel
+        for idx, start in enumerate(heading_indices):
+            end = boundaries[idx + 1]
+            title = lines[start].strip()
+            body_lines = lines[start + 1 : end]
+            text = "\n".join(body_lines)
+            # Collapse 3+ blank lines, strip leading/trailing whitespace
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            if not text:
+                continue
+            chapters.append({"title": title or f"Chapter {idx + 1}", "text": text})
+
+        # Prepend any text that appears before the first heading
+        if heading_indices[0] > 0:
+            preamble = "\n".join(lines[: heading_indices[0]])
+            preamble = re.sub(r"\n{3,}", "\n\n", preamble).strip()
+            if preamble:
+                chapters.insert(0, {"title": "Introduction", "text": preamble})
+
+    log.info("Extracted %d chapter(s) from '%s'", len(chapters), book_title)
+    return {"title": book_title, "chapters": chapters}
+
+
+# ---------------------------------------------------------------------------
+# PDF parsing (text-layer only — scanned/image PDFs will produce no text)
+# ---------------------------------------------------------------------------
+
+def extract_chapters_pdf(pdf_path: Path) -> dict:
+    """
+    Parse a text-layer PDF into book title + chapters.
+
+    Strategy:
+      1. Extract text from every page via pypdf (text-layer only; images ignored).
+      2. Strip repeated headers/footers: short lines (≤80 chars) that appear on
+         3 or more consecutive pages are treated as running heads and removed.
+      3. Detect chapter boundaries using the same heading heuristics as the TXT
+         parser (_TXT_HEADING regex + short isolated lines).
+      4. Fall back to one-chapter-per-N-pages if no headings are detected.
+
+    Scanned PDFs (no embedded text) will extract as empty strings and raise a
+    RuntimeError with a clear message rather than silently producing silence.
+    """
+    if not _PYPDF_AVAILABLE:
+        raise RuntimeError(
+            "pypdf is required for PDF support. Install with:\n"
+            "  pip install pypdf"
+        )
+
+    log.info("Parsing PDF: %s", pdf_path.name)
+    book_title = pdf_path.stem.replace("_", " ").replace("-", " ").title()
+
+    reader = _pypdf.PdfReader(str(pdf_path))
+    total_pages = len(reader.pages)
+    if total_pages == 0:
+        raise RuntimeError(f"PDF has no pages: {pdf_path}")
+
+    # ------------------------------------------------------------------ #
+    # Step 1: extract raw text per page                                   #
+    # ------------------------------------------------------------------ #
+    page_texts: list[str] = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        page_texts.append(text)
+
+    # Guard against image-only PDFs
+    total_chars = sum(len(t) for t in page_texts)
+    if total_chars < 100:
+        raise RuntimeError(
+            f"{pdf_path.name} appears to be a scanned/image PDF (no extractable text). "
+            "Only text-layer PDFs are supported. Use an OCR tool first if needed."
+        )
+
+    # ------------------------------------------------------------------ #
+    # Step 2: detect and strip running headers/footers                    #
+    # A line counts as a running head if it appears verbatim (stripped)   #
+    # on at least 3 pages. We collect the first line and last line of each #
+    # page only — real prose is unlikely to repeat across pages.          #
+    # ------------------------------------------------------------------ #
+    from collections import Counter
+    edge_line_counts: Counter = Counter()
+    for text in page_texts:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if lines:
+            edge_line_counts[lines[0]] += 1
+        if len(lines) > 1:
+            edge_line_counts[lines[-1]] += 1
+
+    running_heads: set[str] = {
+        line for line, count in edge_line_counts.items()
+        if count >= 3 and len(line) <= 120
+    }
+
+    def _strip_running_heads(text: str) -> str:
+        lines = text.splitlines()
+        cleaned = [l for l in lines if l.strip() not in running_heads]
+        return "\n".join(cleaned)
+
+    cleaned_pages = [_strip_running_heads(t) for t in page_texts]
+
+    # ------------------------------------------------------------------ #
+    # Step 3: join pages and split into chapters                          #
+    # Use the same heading heuristics as extract_chapters_txt.            #
+    # ------------------------------------------------------------------ #
+    full_text = "\n\n".join(p.strip() for p in cleaned_pages if p.strip())
+    # Collapse 3+ blank lines (page joins can produce many)
+    full_text = re.sub(r"\n{3,}", "\n\n", full_text)
+
+    lines = full_text.splitlines()
+    total_lines = len(lines)
+
+    heading_indices: list[int] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _TXT_HEADING.match(stripped):
+            heading_indices.append(i)
+            continue
+        # Short isolated line (surrounded by blank lines) — treat as heading
+        if (
+            len(stripped) <= 80
+            and (i == 0 or not lines[i - 1].strip())
+            and (i == total_lines - 1 or not lines[i + 1].strip())
+        ):
+            heading_indices.append(i)
+
+    chapters: list[dict] = []
+
+    if not heading_indices:
+        # No chapter structure — treat the whole PDF as one chapter
+        text = re.sub(r"\n{3,}", "\n\n", full_text).strip()
+        if text:
+            chapters.append({"title": book_title, "text": text})
+    else:
+        boundaries = heading_indices + [total_lines]
+        for idx, start in enumerate(heading_indices):
+            end = boundaries[idx + 1]
+            title = lines[start].strip()
+            body = "\n".join(lines[start + 1:end])
+            body = re.sub(r"\n{3,}", "\n\n", body).strip()
+            if not body:
+                continue
+            chapters.append({"title": title or f"Chapter {idx + 1}", "text": body})
+
+        # Prepend any text before the first heading
+        if heading_indices[0] > 0:
+            preamble = "\n".join(lines[:heading_indices[0]])
+            preamble = re.sub(r"\n{3,}", "\n\n", preamble).strip()
+            if preamble:
+                chapters.insert(0, {"title": "Introduction", "text": preamble})
+
+    if not chapters:
+        raise RuntimeError(f"No text content could be extracted from {pdf_path.name}")
+
+    log.info("Extracted %d chapter(s) from '%s' (%d pages)", len(chapters), book_title, total_pages)
+    return {"title": book_title, "chapters": chapters}
+
+
+def extract_chapters_for_file(path: Path) -> dict:
+    """Dispatch to the correct parser based on file extension."""
+    ext = path.suffix.lower()
+    if ext == ".epub":
+        return extract_chapters(path)
+    if ext == ".txt":
+        return extract_chapters_txt(path)
+    if ext == ".pdf":
+        return extract_chapters_pdf(path)
+    raise ValueError(f"Unsupported file type: {path.suffix!r}. Supported: .epub, .txt, .pdf")
+
+
+# ---------------------------------------------------------------------------
 # Text cleanup for TTS
 # ---------------------------------------------------------------------------
 
@@ -387,6 +663,38 @@ _SPACED_HYPHEN = re.compile(r"(\w)\s+-\s+(\w)")
 # Catches: socially-culturally, politically-economically, physically-mentally
 # Doesn't touch: well-known, long-term, ice-cream, mother-in-law
 _LY_HYPHEN = re.compile(r"(\w+ly)-(\w+ly)\b")
+# Academic citation patterns that the TTS engine reads aloud as gibberish:
+#   "(2018)" / "(2022)"                      — bare year
+#   "(Author Year)" / "(Author Year: 42)"     — author-year
+#   "(Author, Author Year; Author Year, ...)" — multi-citation
+# Exclude date ranges (BCE/CE/BC/AD) and prose parentheticals (no year).
+_BARE_YEAR_CITE = re.compile(r"\(\s*(1[5-9]\d{2}|20[0-2]\d{1})\s*\)")
+_CITATION_AUTHOR_YEAR = re.compile(
+    r"\((?!.*\b(?:BCE|CE|BC|AD|centur|years\s+ago)\b)"
+    r"[^)]*?[A-Z][a-záéíóúàèìòùäëïöüñç]+"
+    r"[^)]*?\b(1[5-9]\d{2}|20[0-2]\d{1})\b"
+    r"[^)]{0,120}\)"
+)
+
+
+def strip_blocked_strings(text: str, blocked: list[str] | None = None) -> str:
+    """Drop any line containing one of the blocked strings (case-insensitive).
+
+    Whole-line removal (not substring splicing) so a watermark on its own line
+    is deleted cleanly without joining the surrounding sentences. Used to remove
+    per-page banners like "Machine Translated by Google" from every format.
+    """
+    blocked = STRIP_STRINGS if blocked is None else blocked
+    if not blocked:
+        return text
+    needles = [b.lower() for b in blocked if b]
+    if not needles:
+        return text
+    kept = [
+        line for line in text.splitlines()
+        if not any(n in line.lower() for n in needles)
+    ]
+    return "\n".join(kept)
 
 
 def clean_for_tts(text: str) -> str:
@@ -430,6 +738,12 @@ def clean_for_tts(text: str) -> str:
     # 4. Strip TOC page-number bleed ("Title 18  Next Title" -> "Title Next
     #    Title"). Runs BEFORE whitespace collapse so the NBSP run still matches.
     text = _TOC_PAGENUM.sub(" ", text)
+    # 4b. Strip academic citations: "(Author Year)", "(Author Year: pages)",
+    #     "(Author, Author Year; ...)", "(2018)". Runs BEFORE parentheses
+    #     wrapping so citations are removed entirely rather than wrapped in
+    #     commas. Date ranges like "(1750–1550 BCE)" are preserved.
+    text = _BARE_YEAR_CITE.sub("", text)
+    text = _CITATION_AUTHOR_YEAR.sub("", text)
     # 5. Collapse runs of whitespace (incl. tabs and non-breaking spaces)
     text = _MULTI_SPACE.sub(" ", text)
     text = text.replace("\u00a0", " ")  # any lone non-breaking space -> space
@@ -473,6 +787,17 @@ def clean_for_tts(text: str) -> str:
     text = re.sub(r",\s+\.", ".", text)
     text = re.sub(r",\s+,", ",", text)
     text = re.sub(r"\s+\.", ".", text)
+    # 13b. Rejoin words split across a line wrap by a hyphen ("inde-\npendence"
+    #      -> "independence"). PDF extraction keeps the soft hyphen at the wrap
+    #      point; left as-is the TTS reads "inde, pendence". Must run before the
+    #      single-newline collapse below so the hyphen+newline pair is consumed.
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    # 13c. Collapse a lone newline (a PDF/TXT line wrap inside a paragraph) into
+    #      a space. Paragraph breaks use "\n\n" and are preserved. Without this,
+    #      every wrapped line ends in "\n" that the TTS reads as a micro-pause,
+    #      e.g. "no doubts\nabout it" -> spoken "no doubts ... about it".
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+    text = _MULTI_SPACE.sub(" ", text)
     # 14. Merge paragraph breaks where the preceding paragraph ends without
     #     sentence-ending punctuation (lead-in sentences that introduce a
     #     blockquote or other continuation). Replace \n\n with a single space
@@ -881,11 +1206,127 @@ def _tts_mlx_local(text: str) -> bytes:
             pass
 
 
+def _tts_piper_local(text: str) -> bytes:
+    """TTS via local Piper inference (https://github.com/rhasspy/piper).
+
+    Piper is a fast, local, neural TTS engine using ONNX models. Unlike MLX,
+    it runs on any CPU (no GPU/Apple Silicon required) and is installable as
+    a single pip wheel (`piper-tts`). Quality is between concatenative
+    engines (macOS `say`, espeak) and high-end cloud TTS — comparable to
+    Kokoro for narration.
+
+    Returns raw PCM bytes (24kHz, 16-bit signed little-endian, mono) — same
+    format as openai_compatible/mlx_local. Piper natively outputs 22050Hz, so
+    we resample to 24000Hz with ffmpeg here so the rest of the pipeline (which
+    assumes 24kHz throughout) stays untouched.
+
+    Speed handling:
+        Piper has no `speed` parameter; instead it uses `--length-scale`
+        (the inverse — larger = slower). We map TTS_SPEED → 1/TTS_SPEED.
+        Example: TTS_SPEED=1.2 → length-scale=0.833 (faster narration).
+
+    Configuration (in .env):
+        TTS_PROVIDER=piper_local
+        PIPER_VOICE_PATH=piper_voices/en_US-ryan-high.onnx   # required
+        # PIPER_BIN=piper   # optional: override the piper executable
+        TTS_SPEED=1.2
+
+    Voice files (.onnx + .onnx.json sidecar) are downloaded once from
+    https://huggingface.co/rhasspy/piper-voices and stored in piper_voices/.
+    """
+    voice_path = os.getenv("PIPER_VOICE_PATH", "").strip()
+    if not voice_path:
+        raise RuntimeError(
+            "PIPER_VOICE_PATH not set. Download a voice from "
+            "https://huggingface.co/rhasspy/piper-voices and point "
+            "PIPER_VOICE_PATH at the .onnx file (e.g. "
+            "piper_voices/en_US-ryan-high.onnx)."
+        )
+    voice_file = Path(voice_path)
+    if not voice_file.is_absolute():
+        voice_file = Path(__file__).parent / voice_file
+    if not voice_file.exists():
+        raise RuntimeError(
+            f"Piper voice file not found at {voice_file}. "
+            f"Download from https://huggingface.co/rhasspy/piper-voices "
+            f"(.onnx + .onnx.json sidecar required)."
+        )
+
+    piper_bin = os.getenv("PIPER_BIN", "").strip() or shutil.which("piper")
+    if not piper_bin:
+        raise RuntimeError(
+            "piper executable not found. Install with `pip install piper-tts` "
+            "in the same venv that runs convert_books.py, or set PIPER_BIN."
+        )
+
+    # Map TTS_SPEED → --length-scale. Piper's length-scale is the inverse of
+    # speed: larger values produce slower speech. So speed=1.2 → length=0.833.
+    # Clamp to a safe range; Piper accepts roughly 0.5..2.0 in practice.
+    length_scale = 1.0 / max(0.25, min(4.0, TTS_SPEED))
+
+    # Piper writes a WAV (22050Hz / 16-bit / mono) to the path given by -f.
+    # We then ask ffmpeg to decode it to raw 24kHz PCM so the part files match
+    # the rest of the pipeline (which assumes 24kHz throughout). The two-step
+    # WAV→PCM round-trip is fine because piper itself takes ~3-5s on a `-high`
+    # voice — the ffmpeg resample is <100ms in comparison.
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+        wav_path = Path(tmp_wav.name)
+    try:
+        proc = subprocess.run(
+            [
+                piper_bin,
+                "-m", str(voice_file),
+                "-f", str(wav_path),
+                "--length-scale", str(length_scale),
+            ],
+            input=text.encode("utf-8"),
+            capture_output=True,
+            timeout=180,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Piper TTS failed (exit {proc.returncode}): "
+                f"{proc.stderr.decode(errors='ignore').strip()[:5000]}"
+            )
+        if not wav_path.exists() or wav_path.stat().st_size == 0:
+            raise RuntimeError(
+                f"Piper reported success but {wav_path} is missing/empty. "
+                f"stderr: {proc.stderr.decode(errors='ignore').strip()[:500]}"
+            )
+
+        # Decode WAV (22050Hz) to raw 24kHz/16-bit/mono PCM via ffmpeg.
+        # -f s16le: raw little-endian PCM output (no WAV header)
+        # -ar 24000: resample to 24kHz (matches openai_compatible/mlx_local)
+        # -ac 1: force mono (Piper is already mono but be defensive)
+        if not ffmpeg_available():
+            raise RuntimeError(
+                "ffmpeg required to convert Piper WAV → PCM but not found in PATH"
+            )
+        ff = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(wav_path),
+             "-f", "s16le", "-acodec", "pcm_s16le",
+             "-ar", "24000", "-ac", "1", "pipe:1"],
+            capture_output=True, timeout=30,
+        )
+        if ff.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg WAV→PCM conversion failed (exit {ff.returncode}): "
+                f"{ff.stderr.decode(errors='ignore').strip()[:500]}"
+            )
+        return ff.stdout
+    finally:
+        try:
+            wav_path.unlink()
+        except OSError:
+            pass
+
+
 # Provider dispatch table — add new providers here.
 _TTS_PROVIDERS = {
     "openai_compatible": _tts_openai_compatible,
     "elevenlabs": _tts_elevenlabs,
     "mlx_local": _tts_mlx_local,
+    "piper_local": _tts_piper_local,
 }
 
 
@@ -1220,6 +1661,8 @@ def render_chapter(title: str, text: str, out_path: Path, tmp_dir: Path) -> None
     # Numeric ranges like "1750–1550" become "1750 to 1550" so the TTS engine
     # doesn't add an audible breath on the en-dash. This eliminates the
     # ~100-300ms pauses that Kokoro and other engines add on these patterns.
+    # Drop blocked strings (e.g. per-page watermarks) regardless of --clean.
+    text = strip_blocked_strings(text)
     if CLEAN_FOR_TTS:
         text = clean_for_tts(text)
     chunks = chunk_text(text, TTS_CHUNK_CHARS)
@@ -1300,17 +1743,33 @@ def render_chapter(title: str, text: str, out_path: Path, tmp_dir: Path) -> None
 # ---------------------------------------------------------------------------
 
 def convert_book(epub_path: Path) -> Path:
-    """Convert one EPUB to a per-chapter folder and a concatenated full-book MP3.
+    """Convert one EPUB or .txt file to a per-chapter folder and a concatenated
+    full-book MP3.
 
     In DRY_RUN mode, only the first ~DRY_RUN_SECONDS of the first chapter are
     converted (1 small TTS call). Output goes to a `dry-run/` subfolder under
     OUTPUT_DIR so it doesn't pollute real runs.
     """
-    parsed = extract_chapters(epub_path)
+    parsed = extract_chapters_for_file(epub_path)
     book_title = parsed["title"]
     chapters = parsed["chapters"]
     if not chapters:
         raise RuntimeError(f"No chapters extracted from {epub_path}")
+
+    if SKIP_CHAPTERS > 0:
+        before = len(chapters)
+        dropped = chapters[:SKIP_CHAPTERS]
+        chapters = chapters[SKIP_CHAPTERS:]
+        log.info(
+            "Skipped first %d chapter(s) (--skip-chapters): %s",
+            min(SKIP_CHAPTERS, before),
+            ", ".join(repr(c["title"][:40]) for c in dropped) or "(none)",
+        )
+        if not chapters:
+            raise RuntimeError(
+                f"--skip-chapters {SKIP_CHAPTERS} dropped all {before} chapters — "
+                f"nothing left to render. Lower the value."
+            )
 
     # --skip-front-matter: drop structural front/back-matter (cover, copyright,
     # TOC, bibliography, index, nav, etc.) by default. See SKIP_FRONT_MATTER_PATTERNS.
@@ -1504,7 +1963,7 @@ def _parse_args(argv: list[str] | None = None) -> dict:
     import argparse
     p = argparse.ArgumentParser(
         prog="convert_books.py",
-        description="Convert EPUB files in ./epubs/ to MP3 audiobooks.",
+        description="Convert EPUB or plain-text (.txt) files in ./epubs/ to MP3 audiobooks.",
     )
     p.add_argument(
         "--dry-run", dest="dry_run", action="store_true",
@@ -1513,17 +1972,18 @@ def _parse_args(argv: list[str] | None = None) -> dict:
              "committing to a full conversion. STILL USES YOUR TTS KEY (1 API call).",
     )
     p.add_argument(
-        "--dry-run-seconds", dest="dry_run_seconds", type=float, default=30.0,
-        help="Length of the dry-run sample in seconds (default: 30).",
+        "--dry-run-seconds", dest="dry_run_seconds", type=float, default=None,
+        help="Length of the dry-run sample in seconds (default: 30). Passing this "
+             "implies --dry-run, so you don't accidentally start a full conversion.",
     )
     p.add_argument(
         "--book", dest="book", type=str, default=None,
-        help="Only convert this one epub (filename or stem) instead of all in INPUT_DIR. "
-             "Combine with --dry-run to sample a specific book.",
+        help="Only convert this one file (filename or stem, .epub, .txt, or .pdf) instead of "
+             "all in INPUT_DIR. Combine with --dry-run to sample a specific book.",
     )
     p.add_argument(
         "--list", dest="list_books", action="store_true",
-        help="List epubs in INPUT_DIR and exit.",
+        help="List supported input files (.epub, .txt, and .pdf) in INPUT_DIR and exit.",
     )
     p.add_argument(
         "--continue", "--resume", dest="continue_run", action="store_true",
@@ -1555,6 +2015,14 @@ def _parse_args(argv: list[str] | None = None) -> dict:
         help="Send raw EPUB text straight to TTS. Use this if the cleanup changes "
              "the meaning or you want maximum control over the input.",
     )
+    p.add_argument(
+        "--skip-chapters", dest="skip_chapters", type=int, default=None,
+        help="Drop the first N extracted chapters before rendering (any format: "
+             ".epub/.txt/.pdf). Use to skip publisher info, dedications, and "
+             "introductions that the title-based front-matter filter can't catch. "
+             "Run with --list or watch the chapter log to pick N. Overrides the "
+             "SKIP_CHAPTERS env var.",
+    )
     args = p.parse_args(argv)
     return {
         "dry_run": args.dry_run,
@@ -1564,6 +2032,7 @@ def _parse_args(argv: list[str] | None = None) -> dict:
         "continue_run": args.continue_run,
         "skip_front_matter": args.skip_front_matter,
         "clean": args.clean,
+        "skip_chapters": args.skip_chapters,
     }
 
 
@@ -1571,49 +2040,57 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     # Make dry-run / continue / skip-front-matter / clean flags module-global so convert_book can see them
-    global DRY_RUN, DRY_RUN_SECONDS, CONTINUE_RUN, SKIP_FRONT_MATTER, CLEAN_FOR_TTS
-    DRY_RUN = args["dry_run"]
-    DRY_RUN_SECONDS = args["dry_run_seconds"]
+    global DRY_RUN, DRY_RUN_SECONDS, CONTINUE_RUN, SKIP_FRONT_MATTER, CLEAN_FOR_TTS, SKIP_CHAPTERS
+    # --dry-run-seconds implies --dry-run (guards against a bare seconds flag
+    # silently starting a full, costly conversion).
+    DRY_RUN = args["dry_run"] or args["dry_run_seconds"] is not None
+    DRY_RUN_SECONDS = args["dry_run_seconds"] if args["dry_run_seconds"] is not None else 30.0
     CONTINUE_RUN = args["continue_run"]
     SKIP_FRONT_MATTER = args["skip_front_matter"]
     CLEAN_FOR_TTS = args["clean"]
+    if args["skip_chapters"] is not None:
+        SKIP_CHAPTERS = max(0, args["skip_chapters"])
 
     if not INPUT_DIR.exists():
         INPUT_DIR.mkdir(parents=True, exist_ok=True)
         log.info("Created %s — drop .epub files in there and re-run.", INPUT_DIR.resolve())
         return 0
 
-    epubs = sorted(INPUT_DIR.glob("*.epub"))
+    all_books = sorted(
+        p for p in INPUT_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
+    epubs = all_books  # variable kept as-is below for minimal diff
     if args["book"]:
         target = args["book"]
         if target.suffix == "":
-            # Treat as a stem — match any file with that stem
-            epubs = [p for p in epubs if p.stem == target.stem or p.name == target.name]
+            # Treat as a stem — match any supported file with that stem
+            epubs = [p for p in all_books if p.stem == target.stem or p.name == target.name]
         else:
-            epubs = [p for p in epubs if p.name == target.name]
+            epubs = [p for p in all_books if p.name == target.name]
         if not epubs:
-            log.error("No epub matching %r in %s", str(target), INPUT_DIR.resolve())
+            log.error("No file matching %r in %s", str(target), INPUT_DIR.resolve())
             log.info("Available:")
-            for p in sorted(INPUT_DIR.glob("*.epub")):
+            for p in all_books:
                 log.info("  - %s", p.name)
             return 1
 
     if args["list_books"]:
         if not epubs:
-            log.info("No .epub files in %s", INPUT_DIR.resolve())
+            log.info("No supported files (.epub, .txt) in %s", INPUT_DIR.resolve())
         else:
-            log.info("Found %d epub(s):", len(epubs))
+            log.info("Found %d file(s):", len(epubs))
             for p in epubs:
                 size_mb = p.stat().st_size / (1024 * 1024)
                 log.info("  - %s  (%.2f MB)", p.name, size_mb)
         return 0
 
     if not epubs:
-        log.info("No .epub files in %s — nothing to do.", INPUT_DIR.resolve())
+        log.info("No supported files (.epub, .txt) in %s — nothing to do.", INPUT_DIR.resolve())
         return 0
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("Found %d EPUB(s). Provider=%s  Model=%s  Voice=%s  Speed=%sx",
+    log.info("Found %d file(s). Provider=%s  Model=%s  Voice=%s  Speed=%sx",
              len(epubs), TTS_PROVIDER, TTS_MODEL, TTS_VOICE, TTS_SPEED)
     if not ffmpeg_available():
         log.warning("ffmpeg not found in PATH — falling back to raw byte concat. "
@@ -1634,7 +2111,7 @@ def main(argv: list[str] | None = None) -> int:
     successes, failures = 0, 0
     for epub_path in epubs:
         log.info("=" * 60)
-        log.info("Book: %s", epub_path.name)
+        log.info("Book: %s  [%s]", epub_path.name, epub_path.suffix.lstrip(".").upper())
         try:
             convert_book(epub_path)
             successes += 1

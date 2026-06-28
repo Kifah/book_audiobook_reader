@@ -14,12 +14,15 @@ env/
 # Project artefacts
 epubs/
 audiobooks/
+piper_voices/
 *.epub
 *.mp3
 *.opus
 *.aac
 *.flac
 *.wav
+*.onnx
+*.onnx.json
 
 # Secrets
 .env
@@ -31,3 +34,6 @@ audiobooks/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Tooling state
+.omo/
